@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Robert Griebl
+// SPDX-License-Identifier: MIT
+
 #ifndef _GNU_SOURCE
 #  define _GNU_SOURCE
 #endif
@@ -5,6 +8,7 @@
 #include <QtCore/QXmlStreamReader>
 #include <QtCore/QDebug>
 #include <QtCore/QUrl>
+#include <QtCore/QStack>
 
 #include <dlfcn.h>
 #include <stdlib.h>
@@ -26,51 +30,22 @@ static beginCreate_fn_t    s_beginFn    = nullptr;
 static completeCreate_fn_t s_completeFn = nullptr;
 static url_fn_t            s_urlFn      = nullptr;
 
-
-/* Resolve the real symbols exactly once. */
-static void resolve_original(void)
+static void resolveFunctions()
 {
-    if (__builtin_expect(s_beginFn != nullptr, 1))
+    if (s_beginFn) [[likely]]
         return;
 
-    *(void **)(&s_beginFn) = dlsym(
-        RTLD_NEXT,
-        "_ZN13QQmlComponent11beginCreateEP11QQmlContext"
-    );
+    *(void **) (&s_beginFn) = dlsym(RTLD_NEXT, "_ZN13QQmlComponent11beginCreateEP11QQmlContext");
+    if (!s_beginFn)
+        qFatal("QML-OBJECT-TRACK: could not resolve QQmlComponent::beginCreate: %s", dlerror());
 
-    if (!s_beginFn) {
-        fprintf(stderr,
-            "qml_hook: fatal - could not resolve "
-            "QQmlComponent::beginCreate via RTLD_NEXT: %s\n",
-            dlerror());
-        abort();
-    }
+    *(void **) (&s_completeFn) = dlsym(RTLD_NEXT, "_ZN13QQmlComponent14completeCreateEv");
+    if (!s_completeFn)
+        qFatal("QML-OBJECT-TRACK: could not resolve QQmlComponent::completeCreate: %s", dlerror());
 
-    *(void **)(&s_completeFn) = dlsym(
-        RTLD_NEXT,
-        "_ZN13QQmlComponent14completeCreateEv"
-    );
-
-    if (!s_completeFn) {
-        fprintf(stderr,
-            "qml_hook: fatal - could not resolve "
-            "QQmlComponent::completeCreate via RTLD_NEXT: %s\n",
-            dlerror());
-        abort();
-    }
-
-    *(void **)(&s_urlFn) = dlsym(
-        RTLD_NEXT,
-        "_ZNK13QQmlComponent3urlEv"
-    );
-
-    if (!s_urlFn) {
-        fprintf(stderr,
-            "qml_hook: fatal - could not resolve "
-            "QQmlComponent::url via RTLD_NEXT: %s\n",
-            dlerror());
-        abort();
-    }
+    *(void **) (&s_urlFn) = dlsym(RTLD_NEXT, "_ZNK13QQmlComponent3urlEv");
+    if (!s_urlFn)
+        qFatal("QML-OBJECT-TRACK: could not resolve QQmlComponent::url: %s", dlerror());
 }
 
 static QByteArray componentUrl(void *self)
@@ -80,70 +55,41 @@ static QByteArray componentUrl(void *self)
 }
 
 
-/* --------------------------------------------------------------------------
- * The interposed function.
- *
- * The __asm__ label exports this C function under the C++ mangled name so
- * the dynamic linker satisfies references to QQmlComponent::beginCreate
- * with our implementation instead of Qt's.
- *
- * Signature in "C" terms (Itanium ABI: implicit this as first argument):
- *   void *hook(void *self, void *context)
- * -------------------------------------------------------------------------- */
-__attribute__((visibility("default")))
-void *qml_beginCreate_hook(void *self, void *context)
+// Hook for QQmlComponent::completeCreate(), Itanium C++ ABI
+[[gnu::visibility("default")]] void *qml_beginCreate_hook(void *self, void *context)
     __asm__("_ZN13QQmlComponent11beginCreateEP11QQmlContext");
 
 void *qml_beginCreate_hook(void *self, void *context)
 {
-    resolve_original();
-
+    resolveFunctions();
     objectTrack(self, componentUrl(self), true);
-
     return s_beginFn(self, context);
 }
 
-/* --------------------------------------------------------------------------
- * Hook for QQmlComponent::completeCreate()
- *
- * Mangled symbol: _ZN13QQmlComponent14completeCreateEv
- * Signature: void completeCreate(void *self)
- * -------------------------------------------------------------------------- */
-__attribute__((visibility("default")))
-void qml_completeCreate_hook(void *self)
+// Hook for QQmlComponent::completeCreate(), Itanium C++ ABI
+[[gnu::visibility("default")]] void qml_completeCreate_hook(void *self)
     __asm__("_ZN13QQmlComponent14completeCreateEv");
 
 void qml_completeCreate_hook(void *self)
 {
-    resolve_original();
-
+    resolveFunctions();
     s_completeFn(self);
-
     objectTrack(self, componentUrl(self), false);
 }
 
-// File-scope state
-static std::mutex  s_mutex;
-static int         s_nestingLevel = 0;
-static int         s_startCount   = 0;   // cumulative calls with startOfFunction=true
-static FILE       *s_csvFile      = nullptr;
-static QList<void *> s_creationStack;
-
-/* --------------------------------------------------------------------------
- * Call malloc_info(3) into an in-memory buffer, parse the XML with
- * QXmlStreamReader, and return the total current heap size in bytes.
- * -------------------------------------------------------------------------- */
+// Call malloc_info(3) into an in-memory buffer, parse the XML with
+// QXmlStreamReader, and return the total current heap size in bytes.
 static size_t measureHeapSize()
 {
-    char  *buf  = nullptr;
+    char *buf  = nullptr;
     size_t size = 0;
 
-    FILE *memf = open_memstream(&buf, &size);
+    auto memf = ::open_memstream(&buf, &size);
     if (!memf)
         return 0;
 
-    malloc_info(0, memf);
-    fclose(memf);   // flushes and finalises buf
+    ::malloc_info(0, memf);
+    ::fclose(memf); // flush and finalize buf
 
     if (!buf)
         return 0;
@@ -161,51 +107,62 @@ static size_t measureHeapSize()
         }
     }
 
-    qWarning() << "CURRENT HEAPSIZE:" << totalHeapSize;
+    qWarning() << "QML-OBJECT-TRACK: current heap size:" << totalHeapSize;
 
-    free(buf);
+    ::free(buf);
     return totalHeapSize;
 }
 
 void objectTrack(void *qmlComponentPtr, const QByteArray &url, bool startOfCreation)
 {
+    // File-scope state
+    static std::mutex s_mutex;
     std::lock_guard<std::mutex> lock(s_mutex);
+
+    static int s_nestingLevel = 0;
+    static int s_startCount = 0; // cumulative calls with startOfFunction=true
+    static QStack<std::tuple<void *, size_t>> s_creationStack;
+
+    // Snapshot URL and heap size while holding the lock
+    const size_t heapSize  = measureHeapSize();
+    QByteArray heapSizeDeltaStr;
 
     if (startOfCreation) {
         ++s_nestingLevel;
         ++s_startCount;
-        s_creationStack.push_back(qmlComponentPtr);
+        s_creationStack.push({ qmlComponentPtr, heapSize });
     } else {
-        if (!s_creationStack.isEmpty() && s_creationStack.last() == qmlComponentPtr)
-            s_creationStack.pop_back();
-        else
-            qWarning() << "Mismatched end of creation for component at" << url;
+        if (s_creationStack.isEmpty()) {
+            qWarning() << "QML-OBJECT-TRACK: unexpected completeCreate for component at" << url;
+        } else {
+            auto [qmlComponentPtrBegin, heapSizeBegin] = s_creationStack.pop();
+            if (qmlComponentPtrBegin != qmlComponentPtr)
+                qWarning() << "QML-OBJECT-TRACK: mismatched completeCreate for component at" << url;
+            else
+                heapSizeDeltaStr = QByteArray::number(heapSize - heapSizeBegin);
+        }
     }
-
-    // Snapshot URL and heap size while holding the lock
-    const size_t heapSize  = measureHeapSize();
-
     // Lazy-open the CSV file on the first write
-    if (!s_csvFile) {
+    static FILE *s_csvFile = [] {
         char filename[64];
         std::snprintf(filename, sizeof(filename), "/tmp/qml-object-track.%d.csv", getpid());
-        s_csvFile = std::fopen(filename, "w");
-        if (!s_csvFile)
-            qFatal("Qml-Object-Tracker: could not open %s for writing", filename);
-    }
+        auto f = std::fopen(filename, "w");
+        if (f)
+            qWarning() << "QML-OBJECT-TRACK: logging into" << filename;
+        else
+            qFatal() << "QML-OBJECT-TRACK: could not open" << filename << "for writing";
+        return f;
+    }();
 
-    if (s_csvFile) {
-        const char bracket = startOfCreation ? '>' : '<';
-        for (int i = 0; i < s_nestingLevel; ++i)
-            std::fputc(bracket, s_csvFile);
-
-        std::fprintf(s_csvFile, ",%s,%zu,%d,%d\n",
-                     url.constData(),
-                     heapSize,
-                     s_nestingLevel,
-                     s_startCount);
-        std::fflush(s_csvFile);
-    }
+    std::fprintf(s_csvFile,
+                 "%s,%s,%zu,%s,%d,%d\n",
+                 QByteArray(s_nestingLevel, startOfCreation ? '>' : '<').constData(),
+                 url.constData(),
+                 heapSize,
+                 heapSizeDeltaStr.constData(),
+                 s_nestingLevel,
+                 s_startCount);
+    std::fflush(s_csvFile);
 
     if (!startOfCreation)
         --s_nestingLevel;
