@@ -19,8 +19,7 @@ static void objectTrack(void *qmlComponentPtr, const QByteArray &url, bool start
 
 typedef void *(*beginCreate_fn_t)(void *self, void *context);
 typedef void *(*completeCreate_fn_t)(void *self);
-/* QUrl QQmlComponent::url() const – Itanium ABI: hidden return pointer first */
-typedef void  (*url_fn_t)(QUrl *ret, const void *self);
+typedef QUrl  (*url_fn_t)(const void *self);
 
 
 static beginCreate_fn_t    s_beginFn    = nullptr;
@@ -76,8 +75,7 @@ static void resolve_original(void)
 
 static QByteArray componentUrl(void *self)
 {
-    QUrl url;
-    s_urlFn(&url, self);
+    QUrl url = s_urlFn(self);
     return url.toString().toUtf8();
 }
 
