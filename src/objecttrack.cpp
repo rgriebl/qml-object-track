@@ -17,18 +17,33 @@
 #include <unistd.h>
 #include <mutex>
 
-
-static void objectTrack(void *qmlComponentPtr, const QByteArray &url, bool startOfCreation);
+static void objectTrack(void *qmlComponentPtr, const QByteArray &url, bool startOfCreation,
+                        size_t preMeasuredHeap = 0);
+static size_t measureHeapSize();
 
 
 typedef void *(*beginCreate_fn_t)(void *self, void *context);
 typedef void *(*completeCreate_fn_t)(void *self);
 typedef QUrl  (*url_fn_t)(const void *self);
+typedef void *(*objectCreator_create_fn_t)(void *self, int subComponentIndex, void *parent,
+                                           void *interrupt, int flags);
+// QQmlContextData::initFromTypeCompilationUnit — called inside create(), sets URL on context
+typedef void  (*initFromType_fn_t)(void *self, const void *unit, int subComponentIndex);
 
 
-static beginCreate_fn_t    s_beginFn    = nullptr;
-static completeCreate_fn_t s_completeFn = nullptr;
-static url_fn_t            s_urlFn      = nullptr;
+static beginCreate_fn_t          s_beginFn                = nullptr;
+static completeCreate_fn_t       s_completeFn             = nullptr;
+static url_fn_t                  s_urlFn                  = nullptr;
+static url_fn_t                  s_contextUrlFn           = nullptr;
+static objectCreator_create_fn_t s_objectCreatorCreateFn  = nullptr;
+static initFromType_fn_t         s_initFromTypeFn         = nullptr;
+
+// Thread-local stack: initFromTypeCompilationUnit pushes {url, startHeap}, create() pops
+struct CreationEntry {
+    QByteArray url;
+    size_t startHeapSize;
+};
+static thread_local QStack<CreationEntry> tls_creationStack;
 
 static void resolveFunctions()
 {
@@ -46,6 +61,22 @@ static void resolveFunctions()
     *(void **) (&s_urlFn) = dlsym(RTLD_NEXT, "_ZNK13QQmlComponent3urlEv");
     if (!s_urlFn)
         qFatal("QML-OBJECT-TRACK: could not resolve QQmlComponent::url: %s", dlerror());
+
+    // QQmlContextData::url() const — same calling convention as QQmlComponent::url()
+    *(void **) (&s_contextUrlFn) = dlsym(RTLD_NEXT, "_ZNK15QQmlContextData3urlEv");
+    if (!s_contextUrlFn)
+        qFatal("QML-OBJECT-TRACK: could not resolve QQmlContextData::url: %s", dlerror());
+
+    *(void **) (&s_objectCreatorCreateFn) = dlsym(RTLD_NEXT,
+        "_ZN17QQmlObjectCreator6createEiP7QObjectP26QQmlInstantiationInterrupti");
+    if (!s_objectCreatorCreateFn)
+        qFatal("QML-OBJECT-TRACK: could not resolve QQmlObjectCreator::create: %s", dlerror());
+
+    // QQmlContextData::initFromTypeCompilationUnit — called inside create(), sets URL on context
+    *(void **) (&s_initFromTypeFn) = dlsym(RTLD_NEXT,
+        "_ZN15QQmlContextData27initFromTypeCompilationUnitERK14QQmlRefPointerIN3QV425ExecutableCompilationUnitEEi");
+    if (!s_initFromTypeFn)
+        qFatal("QML-OBJECT-TRACK: could not resolve QQmlContextData::initFromTypeCompilationUnit: %s", dlerror());
 }
 
 static QByteArray componentUrl(void *self)
@@ -54,28 +85,75 @@ static QByteArray componentUrl(void *self)
     return url.toString().toUtf8();
 }
 
-
-// Hook for QQmlComponent::completeCreate(), Itanium C++ ABI
-[[gnu::visibility("default")]] void *qml_beginCreate_hook(void *self, void *context)
-    __asm__("_ZN13QQmlComponent11beginCreateEP11QQmlContext");
-
-void *qml_beginCreate_hook(void *self, void *context)
+static QByteArray contextUrl(const void *contextData)
 {
-    resolveFunctions();
-    objectTrack(self, componentUrl(self), true);
-    return s_beginFn(self, context);
+    QUrl url = s_contextUrlFn(contextData);
+    return url.toString().toUtf8();
 }
 
-// Hook for QQmlComponent::completeCreate(), Itanium C++ ABI
-[[gnu::visibility("default")]] void qml_completeCreate_hook(void *self)
-    __asm__("_ZN13QQmlComponent14completeCreateEv");
 
-void qml_completeCreate_hook(void *self)
+// // Hook for QQmlComponent::completeCreate(), Itanium C++ ABI
+// [[gnu::visibility("default")]] void *qml_beginCreate_hook(void *self, void *context)
+//     __asm__("_ZN13QQmlComponent11beginCreateEP11QQmlContext");
+
+// void *qml_beginCreate_hook(void *self, void *context)
+// {
+//     resolveFunctions();
+//     objectTrack(self, componentUrl(self), true);
+//     return s_beginFn(self, context);
+// }
+
+// // Hook for QQmlComponent::completeCreate(), Itanium C++ ABI
+// [[gnu::visibility("default")]] void qml_completeCreate_hook(void *self)
+//     __asm__("_ZN13QQmlComponent14completeCreateEv");
+
+// void qml_completeCreate_hook(void *self)
+// {
+//     resolveFunctions();
+//     s_completeFn(self);
+//     objectTrack(self, componentUrl(self), false);
+// }
+
+// Hook for QQmlContextData::initFromTypeCompilationUnit — called early inside create(),
+// before createInstance() does the actual allocations. We capture URL + start heap here.
+[[gnu::visibility("default")]] void qml_initFromType_hook(
+    void *self, const void *unit, int subComponentIndex)
+    __asm__("_ZN15QQmlContextData27initFromTypeCompilationUnitERK14QQmlRefPointerIN3QV425ExecutableCompilationUnitEEi");
+
+void qml_initFromType_hook(void *self, const void *unit, int subComponentIndex)
 {
     resolveFunctions();
-    s_completeFn(self);
-    objectTrack(self, componentUrl(self), false);
+    s_initFromTypeFn(self, unit, subComponentIndex);
+    // After the real call, this QQmlContextData has the URL set
+    tls_creationStack.push({ contextUrl(self), measureHeapSize() });
 }
+
+// Hook for QQmlObjectCreator::create
+[[gnu::visibility("default")]] void *qml_objectCreator_create_hook(
+    void *self, int subComponentIndex, void *parent, void *interrupt, int flags)
+    __asm__("_ZN17QQmlObjectCreator6createEiP7QObjectP26QQmlInstantiationInterrupti");
+
+void *qml_objectCreator_create_hook(
+    void *self, int subComponentIndex, void *parent, void *interrupt, int flags)
+{
+    resolveFunctions();
+
+    int stackDepthBefore = tls_creationStack.size();
+    void *result = s_objectCreatorCreateFn(self, subComponentIndex, parent, interrupt, flags);
+
+    // initFromTypeCompilationUnit is only called when phase == Startup (normal path).
+    // Phase CreatingObjectsPhase2 returns early without it — nothing to track.
+    if (tls_creationStack.size() > stackDepthBefore) {
+        auto entry = tls_creationStack.pop();
+        objectTrack(self, entry.url, true, entry.startHeapSize);
+        objectTrack(self, entry.url, false);
+    }
+
+    return result;
+}
+
+
+// ── Heap measurement ────────────────────────────────────────────────────
 
 // Call malloc_info(3) into an in-memory buffer, parse the XML with
 // QXmlStreamReader, and return the total current heap size in bytes.
@@ -113,7 +191,8 @@ static size_t measureHeapSize()
     return totalHeapSize;
 }
 
-void objectTrack(void *qmlComponentPtr, const QByteArray &url, bool startOfCreation)
+void objectTrack(void *qmlComponentPtr, const QByteArray &url, bool startOfCreation,
+                 size_t preMeasuredHeap)
 {
     // File-scope state
     static std::mutex s_mutex;
@@ -123,8 +202,8 @@ void objectTrack(void *qmlComponentPtr, const QByteArray &url, bool startOfCreat
     static int s_startCount = 0; // cumulative calls with startOfFunction=true
     static QStack<std::tuple<void *, size_t>> s_creationStack;
 
-    // Snapshot URL and heap size while holding the lock
-    const size_t heapSize  = measureHeapSize();
+    // Use pre-measured heap if provided, otherwise measure now
+    const size_t heapSize = preMeasuredHeap ? preMeasuredHeap : measureHeapSize();
     QByteArray heapSizeDeltaStr;
 
     if (startOfCreation) {
