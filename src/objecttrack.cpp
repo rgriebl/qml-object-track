@@ -17,14 +17,14 @@
 #include <unistd.h>
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 
 enum TrackType {
     Create = 0,
     Finalize,
     Delegate,
     Destroy,
-    ComponentCreate // fallback: QQmlObjectCreator hooks bypassed (direct intra-SO calls)
+    DelegateDestroy, // delegate object destroyed via QObject::destroyed signal
+    ComponentCreate  // fallback: QQmlObjectCreator hooks bypassed (direct intra-SO calls)
 };
 
 static void objectTrack(const QByteArray &url, bool startOfCreation, TrackType=Create,
@@ -66,6 +66,13 @@ typedef QObject *(*incubatorObject_fn_t)(const void *self);
 typedef void *(*qmlContext_fn_t)(const QObject *obj);
 // QQmlContext::baseUrl() const — returns QUrl of the context's component file
 typedef QUrl (*contextBaseUrl_fn_t)(const void *self);
+// QQmlApplicationEngine::load(const QUrl &) — called by the application via PLT, so we can hook it
+typedef void (*engineLoad_fn_t)(void *self, const QUrl &url);
+// QQmlComponent::create(QQmlContext*) — synchronous non-incubated create, called from user code
+// with QQmlEngine. QQmlApplicationEngine calls this intra-SO so the PLT hook won't double-fire.
+typedef QObject *(*componentCreateSync_fn_t)(void *self, void *context);
+// QQmlApplicationEngine::rootObjects() const — returns list of root QObjects created by load().
+typedef QList<QObject*> (*rootObjects_fn_t)(const void *self);
 
 
 static beginCreate_fn_t             s_beginFn                = nullptr;
@@ -84,6 +91,9 @@ static incubatorClear_fn_t              s_incubatorClearFn         = nullptr;
 static incubatorObject_fn_t             s_incubatorObjectFn        = nullptr;
 static qmlContext_fn_t                  s_qmlContextFn             = nullptr;
 static contextBaseUrl_fn_t              s_contextBaseUrlFn         = nullptr;
+static engineLoad_fn_t                  s_engineLoadFn             = nullptr;
+static componentCreateSync_fn_t         s_componentCreateSyncFn    = nullptr;
+static rootObjects_fn_t                 s_rootObjectsFn            = nullptr;
 
 // QQmlObjectCreator* → {isDelegate, parentUrl} from constructor
 struct CreatorInfo {
@@ -121,10 +131,17 @@ static thread_local bool tls_initFromTypeFired = false;
 // QQmlComponent::create(incubator) fires for Loaders (not delegates) → erases the map entry.
 // QQmlIncubator::clear() fires after delegate creation → consumes the map entry.
 struct DelegateTrack { QByteArray url; size_t heapBefore; bool initClearFired = false; };
-// URLs ever seen at creation time. emitDestruction is only reported for URLs in this set,
-// which naturally suppresses style contexts (e.g. Fusion Button.qml) that are never tracked
-// at creation because component_create_hook skips them when a delegate incubation is active.
-static std::unordered_set<std::string> s_trackedUrls;
+// Depth of non-empty-URL component contexts currently being destroyed on this thread.
+// Used to distinguish the engine root context (depth==0, also empty URL) from per-delegate
+// wrapper contexts (empty URL, but nested inside a real component context at depth>0).
+static thread_local int  tls_contextDestroyDepth = 0;
+// Set while recursing inside a per-delegate wrapper context so that child style contexts
+// (e.g. Fusion Button.qml) are suppressed. Saved/restored on each hook entry.
+static thread_local bool tls_inDelegateContextDestruction = false;
+// Saved by qml_incubatorClear_hook when the Loader's incubator completes (not a delegate model).
+// The Loader calls clear() inside statusChanged(Ready) which nulls the incubator result before
+// qml_component_create_hook can read it, so we save the pointer here for pickup after create().
+static thread_local QObject *tls_loaderCompletedObject = nullptr;
 static thread_local QByteArray tls_pendingDelegateUrl;
 static thread_local size_t tls_pendingDelegateHeap = 0;
 static thread_local std::unordered_map<void*, DelegateTrack> tls_delegateByIncubator;
@@ -208,6 +225,22 @@ static void resolveFunctions()
     *(void **) (&s_qmlContextFn)      = dlsym(RTLD_NEXT, "_Z10qmlContextPK7QObject");
     *(void **) (&s_contextBaseUrlFn)  = dlsym(RTLD_NEXT, "_ZNK11QQmlContext7baseUrlEv");
 
+    // QQmlApplicationEngine::load(const QUrl &) — app binary → libQt6Qml.so PLT call
+    *(void **) (&s_engineLoadFn) = dlsym(RTLD_NEXT, "_ZN21QQmlApplicationEngine4loadERK4QUrl");
+    if (!s_engineLoadFn)
+        qWarning("QML-OBJECT-TRACK: could not resolve QQmlApplicationEngine::load(QUrl) — root QML file will not be tracked");
+
+    // QQmlComponent::create(QQmlContext*) — synchronous create called from user code with QQmlEngine.
+    // QQmlApplicationEngine calls this intra-SO, so this hook only fires from user-written call sites.
+    *(void **) (&s_componentCreateSyncFn) = dlsym(RTLD_NEXT, "_ZN13QQmlComponent6createEP11QQmlContext");
+    if (!s_componentCreateSyncFn)
+        qWarning("QML-OBJECT-TRACK: could not resolve QQmlComponent::create(QQmlContext*) — QQmlEngine usage will not be tracked");
+
+    // QQmlApplicationEngine::rootObjects() const — used after load() to get new root objects
+    *(void **) (&s_rootObjectsFn) = dlsym(RTLD_NEXT, "_ZNK21QQmlApplicationEngine11rootObjectsEv");
+    if (!s_rootObjectsFn)
+        qWarning("QML-OBJECT-TRACK: could not resolve QQmlApplicationEngine::rootObjects() — main.qml destruction will not be tracked");
+
     qInfo() << "QML-OBJECT-TRACK: successfully loaded";
 }
 
@@ -245,6 +278,77 @@ static QByteArray contextUrl(const void *contextData)
 //     s_completeFn(self);
 //     objectTrack(self, componentUrl(self), false);
 // }
+
+// Hook for QQmlApplicationEngine::load(const QUrl &) — tracks the root QML file.
+// The application binary calls this via PLT, so LD_PRELOAD interposition works.
+// QQmlObjectCreator is called internally within libQt6Qml.so (no PLT), so we can
+// only measure the full heap bracket around the entire engine load here.
+[[gnu::visibility("default")]] void qml_engineLoad_hook(void *self, const QUrl &url)
+    __asm__("_ZN21QQmlApplicationEngine4loadERK4QUrl");
+
+void qml_engineLoad_hook(void *self, const QUrl &url)
+{
+    resolveFunctions();
+    if (!s_engineLoadFn)
+        return;
+
+    QByteArray urlStr = url.toString().toUtf8();
+    size_t rootCountBefore = s_rootObjectsFn ? (size_t)s_rootObjectsFn(self).size() : 0;
+    size_t heapBefore = measureHeapSize();
+    objectTrack(urlStr, true, Create, {}, heapBefore);
+    s_engineLoadFn(self, url);
+    size_t heapAfter = measureHeapSize();
+    objectTrack(urlStr, false, Create, {}, heapAfter);
+
+    if (s_rootObjectsFn) {
+        QList<QObject*> roots = s_rootObjectsFn(self);
+        long long creationDelta = static_cast<long long>(heapAfter) - static_cast<long long>(heapBefore);
+        for (int i = static_cast<int>(rootCountBefore); i < roots.size(); ++i) {
+            if (QObject *obj = roots[i]) {
+                QObject::connect(obj, &QObject::destroyed, [urlStr, creationDelta](QObject *) {
+                    size_t heapNow = measureHeapSize();
+                    size_t heapStart = static_cast<size_t>(
+                        static_cast<long long>(heapNow) + creationDelta);
+                    objectTrack(urlStr, true,  Destroy, {}, heapStart);
+                    objectTrack(urlStr, false, Destroy, {}, heapNow);
+                });
+            }
+        }
+    }
+}
+
+// Hook for QQmlComponent::create(QQmlContext*) — synchronous non-incubated create.
+// Fires when user code calls component.create() directly with a QQmlEngine.
+// When QQmlApplicationEngine is used, this same function is called intra-SO so the
+// PLT hook does not fire — no double-tracking with qml_engineLoad_hook.
+[[gnu::visibility("default")]] QObject *qml_componentCreateSync_hook(void *self, void *context)
+    __asm__("_ZN13QQmlComponent6createEP11QQmlContext");
+
+QObject *qml_componentCreateSync_hook(void *self, void *context)
+{
+    resolveFunctions();
+    if (!s_componentCreateSyncFn)
+        return nullptr;
+
+    QByteArray url = componentUrl(self);
+    size_t heapBefore = measureHeapSize();
+    objectTrack(url, true, Create, {}, heapBefore);
+    QObject *result = s_componentCreateSyncFn(self, context);
+    size_t heapAfter = measureHeapSize();
+    objectTrack(url, false, Create, {}, heapAfter);
+
+    if (result && !url.isEmpty()) {
+        long long creationDelta = static_cast<long long>(heapAfter) - static_cast<long long>(heapBefore);
+        QObject::connect(result, &QObject::destroyed, [url, creationDelta](QObject *) {
+            size_t heapNow = measureHeapSize();
+            size_t heapStart = static_cast<size_t>(
+                static_cast<long long>(heapNow) + creationDelta);
+            objectTrack(url, true,  Destroy, {}, heapStart);
+            objectTrack(url, false, Destroy, {}, heapNow);
+        });
+    }
+    return result;
+}
 
 // Hook for QQmlObjectCreator constructor — detect delegate creation via incubator parameter
 [[gnu::visibility("default")]] void qml_objectCreator_ctor_hook(
@@ -388,25 +492,32 @@ void qml_emitDestruction_hook(void *self)
 
     QByteArray url = contextUrl(self);
 
-    // Per-delegate wrapper contexts have empty url() (created via createRefCounted,
-    // no compilation unit). Their destruction is already reported via QObject::destroyed.
-    // Just recurse so child contexts can be evaluated by their own hook invocations.
     if (url.isEmpty()) {
+        if (tls_contextDestroyDepth > 0) {
+            // Empty URL inside a component context tree → per-delegate wrapper context.
+            // Suppress all its children (Fusion style components etc.) for the duration.
+            bool prev = tls_inDelegateContextDestruction;
+            tls_inDelegateContextDestruction = true;
+            s_emitDestructionFn(self);
+            tls_inDelegateContextDestruction = prev;
+        } else {
+            // Empty URL at depth 0 → engine root context. Just recurse without suppressing.
+            s_emitDestructionFn(self);
+        }
+        return;
+    }
+
+    if (tls_inDelegateContextDestruction) {
+        // Child of a per-delegate wrapper context (e.g. Fusion Button.qml). Suppress.
         s_emitDestructionFn(self);
         return;
     }
 
-    // Only report destruction for URLs we actually tracked at creation. URLs never
-    // seen at creation (e.g. Fusion style components skipped in component_create_hook)
-    // have count == 0 and would be spurious — skip them.
-    if (s_trackedUrls.count(url.toStdString()) == 0) {
-        s_emitDestructionFn(self);
-        return;
-    }
-
+    ++tls_contextDestroyDepth;
     objectTrack(url, true, Destroy);
     s_emitDestructionFn(self);
     objectTrack(url, false, Destroy);
+    --tls_contextDestroyDepth;
 }
 
 
@@ -496,6 +607,16 @@ void qml_incubatorClear_hook(void *self)
             objectUrl = s_contextBaseUrlFn(ctx).toString().toUtf8();
     }
 
+    // For Loader-created components (not delegate model): the Loader calls clear() from inside
+    // statusChanged(Ready) — which fires during QQmlComponent::create(incubator) — so by the
+    // time qml_component_create_hook reads the incubator after create() returns, d->result is
+    // already null. Capture the object here while it is still set, and stash it in a TLS slot
+    // for qml_component_create_hook to pick up and connect destroyed() with the correct delta.
+    if (!hasDelegateInfo && s_incubatorObjectFn) {
+        if (QObject *loaderObj = s_incubatorObjectFn(self))
+            tls_loaderCompletedObject = loaderObj;
+    }
+
     s_incubatorClearFn(self);
 
     // Skip if fine-grained QQmlObjectCreator hooks already tracked this delegate
@@ -518,8 +639,8 @@ void qml_incubatorClear_hook(void *self)
             QObject::connect(obj, &QObject::destroyed, [capturedUrl, capturedDelta](QObject *) {
                 size_t heapNow = measureHeapSize();
                 size_t heapStart = static_cast<size_t>(static_cast<long long>(heapNow) + capturedDelta);
-                objectTrack(capturedUrl, true,  Destroy, {}, heapStart);
-                objectTrack(capturedUrl, false, Destroy, {}, heapNow);
+                objectTrack(capturedUrl, true,  DelegateDestroy, {}, heapStart);
+                objectTrack(capturedUrl, false, DelegateDestroy, {}, heapNow);
             });
         }
     }
@@ -555,6 +676,7 @@ void qml_component_create_hook(void *self, void *incubator, void *context, void 
     // context is suppressed by tls_suppressEmitDestruction / tls_pendingDelegateDestroys.
     if (!tls_delegateByIncubator.empty()) {
         s_componentCreateFn(self, incubator, context, forContext);
+        tls_loaderCompletedObject = nullptr; // discard any sub-object captured by incubatorClear
         return;
     }
 
@@ -562,16 +684,36 @@ void qml_component_create_hook(void *self, void *incubator, void *context, void 
 
     // Reset flag so we can detect if initFromType fires during this call
     tls_initFromTypeFired = false;
+    tls_loaderCompletedObject = nullptr;
     size_t heapBefore = measureHeapSize();
 
     s_componentCreateFn(self, incubator, context, forContext);
 
+    // Pick up the root object saved by qml_incubatorClear_hook. The Loader calls
+    // incubator->clear() inside statusChanged(Ready) — which fires during create() — so
+    // d->result is already null here. The hook captured the pointer before clear() ran.
+    QObject *completedObj = tls_loaderCompletedObject;
+    tls_loaderCompletedObject = nullptr;
+
+    size_t heapAfter = measureHeapSize();
+
     // Only track here if the fine-grained QQmlObjectCreator hooks did NOT fire.
     // If they fired, they already captured the creation with better granularity.
     if (!tls_initFromTypeFired && !url.isEmpty()) {
-        size_t heapAfter = measureHeapSize();
         objectTrack(url, true,  ComponentCreate, {}, heapBefore);
         objectTrack(url, false, ComponentCreate, {}, heapAfter);
+    }
+
+    // Connect destroyed() on the root object to track component teardown (Loader unload / shutdown).
+    if (completedObj && !url.isEmpty()) {
+        long long creationDelta = static_cast<long long>(heapAfter) - static_cast<long long>(heapBefore);
+        QObject::connect(completedObj, &QObject::destroyed, [url, creationDelta](QObject *) {
+            size_t heapNow = measureHeapSize();
+            size_t heapStart = static_cast<size_t>(
+                static_cast<long long>(heapNow) + creationDelta);
+            objectTrack(url, true,  Destroy, {}, heapStart);
+            objectTrack(url, false, Destroy, {}, heapNow);
+        });
     }
 }
 
@@ -602,8 +744,6 @@ void objectTrack(const QByteArray &url, bool startOfCreation, TrackType trackTyp
         ++s_nestingLevel;
         ++s_startCount;
         s_creationStack.push({ url, heapSize });
-        if (trackType != Destroy)
-            s_trackedUrls.insert(url.toStdString());
     } else {
         if (s_creationStack.isEmpty()) {
             qWarning() << "QML-OBJECT-TRACK: unexpected end for component at" << url;
@@ -633,8 +773,9 @@ void objectTrack(const QByteArray &url, bool startOfCreation, TrackType trackTyp
     const char *typeStr = trackType == Create          ? "create"
                         : trackType == Finalize        ? "finalize"
                         : trackType == Delegate        ? "delegate"
-                        : trackType == ComponentCreate ? "component"
-                        : "destroy";
+                        : trackType == Destroy         ? "destroy"
+                        : trackType == DelegateDestroy ? "delegate-destroy"
+                        : "component";
 
     std::fprintf(s_csvFile,
                  "%s,%s,%s,%zu,%s,%d,%d,%s\n",
