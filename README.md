@@ -28,8 +28,12 @@ them (`Type [delegate]`).
 ================================================================================
 ```
 
-The report is emitted on a normal process exit (`atexit`). A process that runs
-forever should use timer mode instead; a hard `_exit()` bypasses the report.
+The final report fires on a graceful Qt quit (`QCoreApplication::aboutToQuit`)
+or, failing that, at `atexit` — whichever happens first, and only once. It shows
+the **peak** state: the peak malloc heap and the tree as it was at (close to) the
+high-water mark, not the post-unload state at exit. A process that runs forever
+should use timer mode; those interval reports show the live state at each tick. A
+hard `_exit()` / `SIGKILL` bypasses the final report.
 
 ## Modes
 

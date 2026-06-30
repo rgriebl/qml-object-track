@@ -10,6 +10,7 @@
 #include <QtCore/QUrl>
 #include <QtCore/QStack>
 #include <QtCore/QAnyStringView>
+#include <QtCore/QCoreApplication>
 
 #include <dlfcn.h>
 #include <stdlib.h>
@@ -1078,6 +1079,9 @@ struct NodeAgg {
     int destroyCount = 0;
 };
 
+using NodeMap = std::map<QByteArray, NodeAgg>;                       // url -> aggregate
+using EdgeMap = std::map<QByteArray, std::map<QByteArray, NodeAgg>>; // parentUrl -> childUrl -> aggregate
+
 // One open creation/destruction bracket. childrenDelta accumulates the
 // (inclusive) deltas of nested brackets so that self = bracket - childrenDelta.
 struct Frame {
@@ -1097,6 +1101,11 @@ struct State {
     std::map<QByteArray, std::map<QByteArray, NodeAgg>> edges;  // parentUrl -> childUrl -> aggregate
     QByteArray rootUrl;                                        // first file created = the tree root
     size_t peakHeap = 0;
+    // Snapshot of nodes/edges at (close to) the peak heap, so the final report can
+    // show the tree as it was at the high-water mark rather than the post-unload state.
+    NodeMap peakNodes;
+    EdgeMap peakEdges;
+    size_t peakSnapshotHeap = 0;
     int nestingLevel = 0;
     int startCount = 0;
     QStack<Frame> trackStack;
@@ -1183,20 +1192,21 @@ void accumulate(State &st, const QByteArray &url, const QByteArray &parentUrl,
 // Inclusive subtree totals: a node's own self plus all of its descendants'.
 struct Incl { long long create = 0; long long destroy = 0; };
 
-Incl inclusiveOf(State &st, const QByteArray &url, std::set<QByteArray> &visited)
+Incl inclusiveOf(const NodeMap &nodes, const EdgeMap &edges,
+                 const QByteArray &url, std::set<QByteArray> &visited)
 {
     Incl r;
-    auto nit = st.nodes.find(url);
-    if (nit != st.nodes.end()) {
+    auto nit = nodes.find(url);
+    if (nit != nodes.end()) {
         r.create = nit->second.createDelta;
         r.destroy = nit->second.destroyDelta;
     }
     if (!visited.insert(url).second)   // already on this path -> stop (cycle guard)
         return r;
-    auto eit = st.edges.find(url);
-    if (eit != st.edges.end()) {
+    auto eit = edges.find(url);
+    if (eit != edges.end()) {
         for (const auto &c : eit->second) {
-            Incl ci = inclusiveOf(st, c.first, visited);
+            Incl ci = inclusiveOf(nodes, edges, c.first, visited);
             r.create += ci.create;
             r.destroy += ci.destroy;
         }
@@ -1209,21 +1219,22 @@ struct ChildRef { QByteArray url; int count; };
 
 // Gather the children of a node as ChildRefs, skipping destroy-only artifacts
 // (files seen only at teardown, e.g. base components on the coarse-hook path).
-std::vector<ChildRef> childrenOf(State &st, const QByteArray &url)
+std::vector<ChildRef> childrenOf(const NodeMap &nodes, const EdgeMap &edges, const QByteArray &url)
 {
     std::vector<ChildRef> kids;
-    auto eit = st.edges.find(url);
-    if (eit != st.edges.end()) {
+    auto eit = edges.find(url);
+    if (eit != edges.end()) {
         for (const auto &c : eit->second) {
-            auto nit = st.nodes.find(c.first);
-            if (nit != st.nodes.end() && nit->second.createCount > 0)
+            auto nit = nodes.find(c.first);
+            if (nit != nodes.end() && nit->second.createCount > 0)
                 kids.push_back({ c.first, c.second.createCount });
         }
     }
     return kids;
 }
 
-void printChildren(FILE *out, State &st, const std::vector<ChildRef> &children,
+void printChildren(FILE *out, const NodeMap &nodes, const EdgeMap &edges,
+                   const std::vector<ChildRef> &children,
                    int indent, int depth, std::set<QByteArray> &path)
 {
     struct Row { QByteArray url; int count; Incl incl; long long self; };
@@ -1231,10 +1242,10 @@ void printChildren(FILE *out, State &st, const std::vector<ChildRef> &children,
     rows.reserve(children.size());
     for (const auto &c : children) {
         std::set<QByteArray> vis;
-        Incl in = inclusiveOf(st, c.url, vis);
+        Incl in = inclusiveOf(nodes, edges, c.url, vis);
         long long self = 0;
-        auto nit = st.nodes.find(c.url);
-        if (nit != st.nodes.end())
+        auto nit = nodes.find(c.url);
+        if (nit != nodes.end())
             self = nit->second.createDelta;
         rows.push_back({ c.url, c.count, in, self });
     }
@@ -1268,10 +1279,10 @@ void printChildren(FILE *out, State &st, const std::vector<ChildRef> &children,
 
         const bool depthOk = (config().maxDepth == 0) || (depth < config().maxDepth);
         if (depthOk && path.find(row.url) == path.end()) {
-            std::vector<ChildRef> kids = childrenOf(st, row.url);
+            std::vector<ChildRef> kids = childrenOf(nodes, edges, row.url);
             if (!kids.empty()) {
                 path.insert(row.url);
-                printChildren(out, st, kids, indent + 1, depth + 1, path);
+                printChildren(out, nodes, edges, kids, indent + 1, depth + 1, path);
                 path.erase(row.url);
             }
         }
@@ -1283,7 +1294,9 @@ void printChildren(FILE *out, State &st, const std::vector<ChildRef> &children,
     }
 }
 
-void printReport(const char *reason)
+// usePeak: render the tree/heap from the peak-heap snapshot (the final report)
+// rather than the current, post-unload state (the interval reports).
+void printReport(const char *reason, bool usePeak)
 {
     State &st = state();
     std::lock_guard<std::mutex> lock(st.mutex);
@@ -1292,16 +1305,27 @@ void printReport(const char *reason)
     if (now > st.peakHeap)
         st.peakHeap = now;
 
+    // Pick the snapshot to render. Fall back to the live maps if we never took a
+    // peak snapshot (e.g. heap never grew past the threshold).
+    const bool havePeak = usePeak && !st.peakNodes.empty();
+    const NodeMap &nodes = havePeak ? st.peakNodes : st.nodes;
+    const EdgeMap &edges = havePeak ? st.peakEdges : st.edges;
+
     FILE *out = stderr;
-    std::fprintf(out, "\n==================== QML object-track report (%s) - pid %d ====================\n",
-                 reason, (int)getpid());
-    std::fprintf(out, "  malloc in-use now : %s\n", fmtBytes((long long)now).constData());
-    std::fprintf(out, "  peak malloc in-use: %s\n", fmtBytes((long long)st.peakHeap).constData());
+    std::fprintf(out, "\n==================== QML object-track report (%s%s) - pid %d ====================\n",
+                 reason, havePeak ? ", at peak" : "", (int)getpid());
+    if (havePeak) {
+        std::fprintf(out, "  peak malloc in-use : %s   (current %s)\n",
+                     fmtBytes((long long)st.peakHeap).constData(), fmtBytes((long long)now).constData());
+    } else {
+        std::fprintf(out, "  malloc in-use now  : %s\n", fmtBytes((long long)now).constData());
+        std::fprintf(out, "  peak malloc in-use : %s\n", fmtBytes((long long)st.peakHeap).constData());
+    }
     size_t createdFiles = 0;
-    for (const auto &ne : st.nodes)
+    for (const auto &ne : nodes)
         if (ne.second.createCount > 0)
             ++createdFiles;
-    std::fprintf(out, "  QML files tracked : %zu   (showing top %d per level)\n",
+    std::fprintf(out, "  QML files tracked  : %zu   (showing top %d per level)\n",
                  createdFiles, config().items);
 
     if (::getenv("QML_OBJECT_TRACK_DEBUG")) {
@@ -1324,23 +1348,23 @@ void printReport(const char *reason)
     // owner's bracket closed). Rather than show those at the top level where they'd
     // masquerade as roots, we leave them out entirely.
     std::vector<ChildRef> roots;
-    auto rit = st.nodes.find(st.rootUrl);
-    if (rit != st.nodes.end() && rit->second.createCount > 0) {
+    auto rit = nodes.find(st.rootUrl);
+    if (rit != nodes.end() && rit->second.createCount > 0) {
         roots.push_back({ st.rootUrl, rit->second.createCount });
     } else {
         // Fallback (no recorded root): show every created node with no incoming edge.
         std::set<QByteArray> childUrls;
-        for (const auto &pe : st.edges)
+        for (const auto &pe : edges)
             for (const auto &ce : pe.second)
                 childUrls.insert(ce.first);
-        for (const auto &ne : st.nodes)
+        for (const auto &ne : nodes)
             if (ne.second.createCount > 0 && childUrls.find(ne.first) == childUrls.end())
                 roots.push_back({ ne.first, ne.second.createCount });
     }
 
-    std::fprintf(out, "  QML trackdown:\n\n");
+    std::fprintf(out, "  QML trackdown%s:\n\n", havePeak ? " (at peak heap)" : "");
     std::set<QByteArray> path;
-    printChildren(out, st, roots, 1, 0, path);
+    printChildren(out, nodes, edges, roots, 1, 0, path);
     std::fprintf(out, "================================================================================\n\n");
     std::fflush(out);
 }
@@ -1366,14 +1390,23 @@ void stopTimerThread()
         s_timerThread.join();
 }
 
+// The final (peak) report, emitted at most once — both QCoreApplication::aboutToQuit
+// and atexit() try to fire it, whichever happens first wins.
+std::atomic<bool> s_finalReported{false};
+void printFinalReport(const char *reason)
+{
+    bool expected = false;
+    if (!s_finalReported.compare_exchange_strong(expected, true))
+        return;
+    stopTimerThread();
+    printReport(reason, /*usePeak=*/true);
+}
+
 void ensureReportingInit()
 {
     static std::once_flag once;
     std::call_once(once, [] {
-        ::atexit([] {
-            stopTimerThread();
-            printReport("final");
-        });
+        ::atexit([] { printFinalReport("final"); });
         if (config().timer) {
             s_timerStarted.store(true);
             s_timerThread = std::thread([] {
@@ -1383,12 +1416,29 @@ void ensureReportingInit()
                                            [] { return s_timerStop; }))
                         break;
                     lk.unlock();
-                    printReport("interval");
+                    printReport("interval", /*usePeak=*/false);   // interval reports show live state
                     lk.lock();
                 }
             });
         }
     });
+}
+
+// Connect to QCoreApplication::aboutToQuit so the final report also fires on a
+// graceful Qt quit (more reliable than atexit alone, e.g. under an app manager).
+// Connected lazily once qApp exists; fires the report at most once (see above).
+void ensureQuitHook()
+{
+    static std::atomic<bool> connected{false};
+    if (connected.load(std::memory_order_acquire))
+        return;
+    QCoreApplication *app = QCoreApplication::instance();
+    if (!app)
+        return;
+    bool expected = false;
+    if (!connected.compare_exchange_strong(expected, true))
+        return;
+    QObject::connect(app, &QCoreApplication::aboutToQuit, [] { printFinalReport("aboutToQuit"); });
 }
 
 } // namespace
@@ -1406,11 +1456,13 @@ void objectTrack(const QByteArray &url, bool startOfCreation, TrackType trackTyp
                  const QByteArray &parentUrl, size_t precomputedHeapSize)
 {
     ensureReportingInit();
+    ensureQuitHook();   // connect aboutToQuit once qApp exists (no-op until then)
     State &st = state();
     std::lock_guard<std::mutex> lock(st.mutex);
 
     const size_t heapSize = (precomputedHeapSize != 0) ? precomputedHeapSize : measureHeapSize();
-    if (heapSize > st.peakHeap)
+    const bool newPeak = heapSize > st.peakHeap;
+    if (newPeak)
         st.peakHeap = heapSize;
 
     QByteArray heapSizeDeltaStr;
@@ -1448,6 +1500,19 @@ void objectTrack(const QByteArray &url, bool startOfCreation, TrackType trackTyp
 
     if (haveDelta)
         accumulate(st, url, parentUrl, trackType, selfDelta);
+
+    // Snapshot the tree near each new heap high-water mark so the final report can
+    // show the peak state. Throttled by a byte threshold so the copy doesn't run on
+    // every allocation during ramp-up; the last snapshot lands within the threshold
+    // of the true peak (the header still reports the exact peak value).
+    if (newPeak) {
+        constexpr size_t kPeakSnapshotThreshold = 1u << 20;   // 1 MB
+        if (heapSize - st.peakSnapshotHeap >= kPeakSnapshotThreshold) {
+            st.peakNodes = st.nodes;
+            st.peakEdges = st.edges;
+            st.peakSnapshotHeap = heapSize;
+        }
+    }
 
     // The detailed CSV is only written in detailed mode (or with CSV=1).
     if (config().csv) {
