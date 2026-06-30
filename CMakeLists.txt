@@ -42,3 +42,5 @@ add_subdirectory(test)
 # --------------------------------------------------------------------------
 message(STATUS "Build with:  cmake -B build && cmake --build build")
 message(STATUS "Inject with: LD_PRELOAD=\${CMAKE_BINARY_DIR}/libqml-object-track.so ./your-qt-app")
+message(STATUS "  prints a heap-influence report at exit; see README.md for the")
+message(STATUS "  QML_OBJECT_TRACK_MODE / _ITEMS / _INTERVAL / _DEPTH / _CSV env vars")

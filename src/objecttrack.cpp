@@ -9,6 +9,7 @@
 #include <QtCore/qobject.h>
 #include <QtCore/QUrl>
 #include <QtCore/QStack>
+#include <QtCore/QAnyStringView>
 
 #include <dlfcn.h>
 #include <stdlib.h>
@@ -17,6 +18,15 @@
 #include <unistd.h>
 #include <mutex>
 #include <unordered_map>
+#include <map>
+#include <set>
+#include <vector>
+#include <algorithm>
+#include <cstring>
+#include <thread>
+#include <condition_variable>
+#include <atomic>
+#include <chrono>
 
 enum TrackType {
     Create = 0,
@@ -73,6 +83,9 @@ typedef void (*engineLoad_fn_t)(void *self, const QUrl &url);
 typedef QObject *(*componentCreateSync_fn_t)(void *self, void *context);
 // QQmlApplicationEngine::rootObjects() const — returns list of root QObjects created by load().
 typedef QList<QObject*> (*rootObjects_fn_t)(const void *self);
+// QQmlApplicationEngine::loadFromModule(QAnyStringView, QAnyStringView) — the modern entry point
+// (loadFromModule does NOT call load(QUrl), so the root QML file is otherwise untracked).
+typedef void (*loadFromModule_fn_t)(void *self, QAnyStringView uri, QAnyStringView typeName);
 
 
 static beginCreate_fn_t             s_beginFn                = nullptr;
@@ -94,6 +107,27 @@ static contextBaseUrl_fn_t              s_contextBaseUrlFn         = nullptr;
 static engineLoad_fn_t                  s_engineLoadFn             = nullptr;
 static componentCreateSync_fn_t         s_componentCreateSyncFn    = nullptr;
 static rootObjects_fn_t                 s_rootObjectsFn            = nullptr;
+static loadFromModule_fn_t              s_loadFromModuleFn         = nullptr;
+
+// QQmlObjectCreator destructor — the bracket end for per-component sizing.
+typedef void (*objectCreatorDtor_fn_t)(void *self);
+static objectCreatorDtor_fn_t           s_objectCreatorDtorFn      = nullptr;
+
+// Diagnostics: per-hook invocation counters (printed at report time when the
+// QML_OBJECT_TRACK_DEBUG env var is set). Used to see which creation/teardown
+// hooks are actually reachable on a given Qt build.
+enum HookId {
+    H_initFromType, H_objCreate, H_objCtor, H_objDtor, H_finalize, H_emitDestroy,
+    H_creationCtx, H_incubatorClear, H_componentCreate, H_componentSync,
+    H_loadModule, H_COUNT
+};
+static std::atomic<long> s_hookCounts[H_COUNT];
+static const char *s_hookNames[H_COUNT] = {
+    "initFromType", "objectCreator::create", "objectCreator::ctor",
+    "objectCreator::dtor", "objectCreator::finalize", "emitDestruction",
+    "creationContext", "incubator::clear", "component::create(incubator)",
+    "component::create(ctx)", "loadFromModule"
+};
 
 // QQmlObjectCreator* → {isDelegate, parentUrl} from constructor
 struct CreatorInfo {
@@ -130,7 +164,7 @@ static thread_local bool tls_initFromTypeFired = false;
 // QQmlIncubatorC2 constructor fires next → moves the snapshot into a per-incubator map.
 // QQmlComponent::create(incubator) fires for Loaders (not delegates) → erases the map entry.
 // QQmlIncubator::clear() fires after delegate creation → consumes the map entry.
-struct DelegateTrack { QByteArray url; size_t heapBefore; bool initClearFired = false; };
+struct DelegateTrack { QByteArray url; QByteArray parentUrl; size_t heapBefore; bool initClearFired = false; };
 // Depth of non-empty-URL component contexts currently being destroyed on this thread.
 // Used to distinguish the engine root context (depth==0, also empty URL) from per-delegate
 // wrapper contexts (empty URL, but nested inside a real component context at depth>0).
@@ -143,8 +177,27 @@ static thread_local bool tls_inDelegateContextDestruction = false;
 // qml_component_create_hook can read it, so we save the pointer here for pickup after create().
 static thread_local QObject *tls_loaderCompletedObject = nullptr;
 static thread_local QByteArray tls_pendingDelegateUrl;
+static thread_local QByteArray tls_pendingDelegateParent;
 static thread_local size_t tls_pendingDelegateHeap = 0;
 static thread_local std::unordered_map<void*, DelegateTrack> tls_delegateByIncubator;
+
+// Sub-component (delegate base-component) sizing. Only active when
+// QML_OBJECT_TRACK_SUBCOMPONENTS is set. While a delegate is being built we
+// bracket every nested QQmlObjectCreator (ctor..dtor) so the delegate's base
+// components show up as its children with their own heap sizes. Names come from
+// the parent context URL when available, otherwise a placeholder.
+struct SubFrame { QByteArray parentUrl; size_t heapBegin; long long childrenDelta; bool isRoot; };
+static thread_local bool tls_inDelegateBuild = false;
+static thread_local bool tls_delegateRootSeen = false;
+static thread_local QStack<SubFrame> tls_subStack;
+static thread_local std::vector<std::pair<QByteArray, long long>> tls_subComponents;
+static thread_local long long tls_delegateSubHeap = 0;
+
+static bool subComponentsEnabled()
+{
+    static const bool v = (::getenv("QML_OBJECT_TRACK_SUBCOMPONENTS") != nullptr);
+    return v;
+}
 
 static void resolveFunctions()
 {
@@ -241,6 +294,17 @@ static void resolveFunctions()
     if (!s_rootObjectsFn)
         qWarning("QML-OBJECT-TRACK: could not resolve QQmlApplicationEngine::rootObjects() — main.qml destruction will not be tracked");
 
+    // QQmlApplicationEngine::loadFromModule(QAnyStringView, QAnyStringView)
+    *(void **) (&s_loadFromModuleFn) = dlsym(RTLD_NEXT,
+        "_ZN21QQmlApplicationEngine14loadFromModuleE14QAnyStringViewS0_");
+    if (!s_loadFromModuleFn)
+        qWarning("QML-OBJECT-TRACK: could not resolve QQmlApplicationEngine::loadFromModule() — root QML module will not be tracked");
+
+    // QQmlObjectCreator destructor — bracket end for sub-component sizing.
+    *(void **) (&s_objectCreatorDtorFn) = dlsym(RTLD_NEXT, "_ZN17QQmlObjectCreatorD1Ev");
+    if (!s_objectCreatorDtorFn)
+        qWarning("QML-OBJECT-TRACK: could not resolve ~QQmlObjectCreator — sub-component sizing disabled");
+
     qInfo() << "QML-OBJECT-TRACK: successfully loaded";
 }
 
@@ -317,6 +381,65 @@ void qml_engineLoad_hook(void *self, const QUrl &url)
     }
 }
 
+// Hook for QQmlApplicationEngine::loadFromModule(QAnyStringView, QAnyStringView).
+// loadFromModule() does not call load(QUrl), so without this the root QML file
+// (e.g. Main.qml) is never tracked. The application calls this via PLT, so the
+// LD_PRELOAD interposition works. On builds where the fine-grained
+// QQmlObjectCreator hooks fire during the load (tls_initFromTypeFired), they
+// already captured the root with nesting, so we suppress our coarse tracking.
+[[gnu::visibility("default")]] void qml_loadFromModule_hook(void *self, QAnyStringView uri,
+                                                            QAnyStringView typeName)
+    __asm__("_ZN21QQmlApplicationEngine14loadFromModuleE14QAnyStringViewS0_");
+
+void qml_loadFromModule_hook(void *self, QAnyStringView uri, QAnyStringView typeName)
+{
+    resolveFunctions();
+    ++s_hookCounts[H_loadModule];
+    if (!s_loadFromModuleFn) {
+        qFatal("QML-OBJECT-TRACK: loadFromModule hook with no resolved function");
+        return;
+    }
+
+    size_t rootCountBefore = s_rootObjectsFn ? (size_t)s_rootObjectsFn(self).size() : 0;
+    tls_initFromTypeFired = false;
+    size_t heapBefore = measureHeapSize();
+    s_loadFromModuleFn(self, uri, typeName);
+    size_t heapAfter = measureHeapSize();
+
+    // If the fine-grained hooks fired during the load, they already tracked the
+    // root component (and its synchronous children) with proper nesting.
+    if (tls_initFromTypeFired || !s_rootObjectsFn)
+        return;
+
+    QList<QObject*> roots = s_rootObjectsFn(self);
+    QObject *mainObj = nullptr;
+    for (int i = (int)rootCountBefore; i < roots.size(); ++i) {
+        if (roots[i]) { mainObj = roots[i]; break; }
+    }
+    if (!mainObj)
+        return;
+
+    // The root file URL comes from the created object's context base URL.
+    QByteArray url;
+    if (s_qmlContextFn && s_contextBaseUrlFn) {
+        if (void *ctx = s_qmlContextFn(mainObj))
+            url = s_contextBaseUrlFn(ctx).toString().toUtf8();
+    }
+    if (url.isEmpty())
+        return;
+
+    objectTrack(url, true,  Create, {}, heapBefore);
+    objectTrack(url, false, Create, {}, heapAfter);
+
+    long long creationDelta = (long long)heapAfter - (long long)heapBefore;
+    QObject::connect(mainObj, &QObject::destroyed, [url, creationDelta](QObject *) {
+        size_t heapNow = measureHeapSize();
+        size_t heapStart = (size_t)((long long)heapNow + creationDelta);
+        objectTrack(url, true,  Destroy, {}, heapStart);
+        objectTrack(url, false, Destroy, {}, heapNow);
+    });
+}
+
 // Hook for QQmlComponent::create(QQmlContext*) — synchronous non-incubated create.
 // Fires when user code calls component.create() directly with a QQmlEngine.
 // When QQmlApplicationEngine is used, this same function is called intra-SO so the
@@ -327,6 +450,7 @@ void qml_engineLoad_hook(void *self, const QUrl &url)
 QObject *qml_componentCreateSync_hook(void *self, void *context)
 {
     resolveFunctions();
+    ++s_hookCounts[H_componentSync];
     if (!s_componentCreateSyncFn)
         return nullptr;
 
@@ -362,6 +486,7 @@ void qml_objectCreator_ctor_hook(
     const void *creationContext, const void *inlineComponentName, void *incubator)
 {
     resolveFunctions();
+    ++s_hookCounts[H_objCtor];
     s_objectCreatorCtorFn(self, parentContext, compilationUnit,
                           creationContext, inlineComponentName, incubator);
 
@@ -371,8 +496,49 @@ void qml_objectCreator_ctor_hook(
     if (contextDataPtr)
         parentUrl = contextUrl(contextDataPtr);
 
+    // While a delegate is being built, open a heap bracket for this creator so
+    // its (and its nested children's) size can be attributed under the delegate.
+    // The outermost creator is the delegate root itself, so it is flagged isRoot
+    // and not reported as a base component.
+    if (subComponentsEnabled() && tls_inDelegateBuild) {
+        // The first creator of a delegate build is the delegate root itself;
+        // every later creator (nested or sequential) is a base component.
+        bool isRoot = !tls_delegateRootSeen;
+        tls_delegateRootSeen = true;
+        tls_subStack.push({ isRoot ? QByteArray() : parentUrl, measureHeapSize(), 0, isRoot });
+    }
+
     std::lock_guard<std::mutex> lock(s_creatorInfoMutex);
     s_creatorInfoMap[self] = { incubator != nullptr, std::move(parentUrl) };
+}
+
+// Hook for ~QQmlObjectCreator — closes the heap bracket opened in the ctor hook
+// and records each nested (non-root) creator as a base component of the delegate.
+[[gnu::visibility("default")]] void qml_objectCreator_dtor_hook(void *self)
+    __asm__("_ZN17QQmlObjectCreatorD1Ev");
+
+void qml_objectCreator_dtor_hook(void *self)
+{
+    resolveFunctions();
+    ++s_hookCounts[H_objDtor];
+
+    if (subComponentsEnabled() && tls_inDelegateBuild && !tls_subStack.isEmpty()) {
+        // Measure before the real dtor: the object is already built; the dtor
+        // only frees the creator's transient bookkeeping.
+        size_t heapNow = measureHeapSize();
+        SubFrame f = tls_subStack.pop();
+        long long bracketDelta = static_cast<long long>(heapNow) - static_cast<long long>(f.heapBegin);
+        long long selfDelta = bracketDelta - f.childrenDelta;
+        if (!tls_subStack.isEmpty())
+            tls_subStack.top().childrenDelta += bracketDelta;
+        if (!f.isRoot) {
+            tls_subComponents.push_back({ f.parentUrl, selfDelta });
+            tls_delegateSubHeap += selfDelta;
+        }
+    }
+
+    if (s_objectCreatorDtorFn)
+        s_objectCreatorDtorFn(self);
 }
 
 // Hook for QQmlContextData::initFromTypeCompilationUnit — called early inside create(),
@@ -384,20 +550,31 @@ void qml_objectCreator_ctor_hook(
 void qml_initFromType_hook(void *self, const void *unit, int subComponentIndex)
 {
     resolveFunctions();
+    ++s_hookCounts[H_initFromType];
     s_initFromTypeFn(self, unit, subComponentIndex);
     // Signal that fine-grained tracking fired, so the component-level fallback hook
     // knows to skip its coarse-grained tracking.
     tls_initFromTypeFired = true;
     // After the real call, this QQmlContextData has the URL set — start tracking here
     QByteArray url = contextUrl(self);
-    // subComponentIndex >= 0 means an inline sub-component (e.g. GridView delegate definition),
-    // incubator != null (tls_currentIsDelegate) catches incubated/async delegate creation.
-    TrackType type = (tls_currentIsDelegate || subComponentIndex >= 0) ? Delegate : Create;
+    // subComponentIndex >= 0 means an inline sub-component: an inline delegate or
+    // inline Component defined *inside* this file. It shares the file's URL and is
+    // part of that file's instance, NOT a separate instance of it. incubator != null
+    // (tls_currentIsDelegate) with subComponentIndex < 0 is a real (separate-file)
+    // delegate, which IS a genuine instance.
+    const bool inlineSub = (subComponentIndex >= 0);
+    TrackType type = (tls_currentIsDelegate || inlineSub) ? Delegate : Create;
 
     // Determine parent: if we're nested inside another creation, the stack top is the parent.
     // Only fall back to tls_currentParentUrl (from QQmlObjectCreator constructor) for top-level.
     QByteArray parentUrl;
-    if (!tls_creationStack.isEmpty()) {
+    if (inlineSub) {
+        // Mark internal (parent == url): adds heap to the file without inventing a
+        // new instance or an edge to whatever ancestor happens to be on the stack
+        // (which, for deferred-built inline delegates, is often the wrong one). Its
+        // own children still nest under the file, because we push the file url below.
+        parentUrl = url;
+    } else if (!tls_creationStack.isEmpty()) {
         parentUrl = tls_creationStack.top().url;
     } else if (tls_currentParentUrl != url) {
         // Use constructor's parentContext URL, but filter out self-references (base type creators)
@@ -417,6 +594,7 @@ void *qml_objectCreator_create_hook(
     void *self, int subComponentIndex, void *parent, void *interrupt, int flags)
 {
     resolveFunctions();
+    ++s_hookCounts[H_objCreate];
 
     // Get constructor info: delegate flag + parent URL
     {
@@ -456,6 +634,7 @@ void *qml_objectCreator_create_hook(
 bool qml_objectCreator_finalize_hook(void *self, void *interrupt)
 {
     resolveFunctions();
+    ++s_hookCounts[H_finalize];
 
     QByteArray url;
     QByteArray parentUrl;
@@ -489,6 +668,7 @@ bool qml_objectCreator_finalize_hook(void *self, void *interrupt)
 void qml_emitDestruction_hook(void *self)
 {
     resolveFunctions();
+    ++s_hookCounts[H_emitDestroy];
 
     QByteArray url = contextUrl(self);
 
@@ -530,11 +710,18 @@ void qml_emitDestruction_hook(void *self)
 void *qml_creationContext_hook(const void *self)
 {
     resolveFunctions();
+    ++s_hookCounts[H_creationCtx];
     void *result = s_creationContextFn(self);
     QByteArray url = componentUrl(const_cast<void *>(self));
     if (!url.isEmpty()) {
         tls_pendingDelegateUrl   = url;
         tls_pendingDelegateHeap  = measureHeapSize();
+        // The creation context is where the delegate is *used* (e.g. the
+        // ListView's file). Record it so the report can nest the delegate
+        // under its host file instead of listing it as a top-level entry.
+        tls_pendingDelegateParent.clear();
+        if (result && s_contextBaseUrlFn)
+            tls_pendingDelegateParent = s_contextBaseUrlFn(result).toString().toUtf8();
     }
     return result;
 }
@@ -553,9 +740,18 @@ void qml_incubatorCtor_hook(void *self, int mode)
     s_incubatorCtorFn(self, mode);
     tls_initFromTypeFired = false;
     if (!tls_pendingDelegateUrl.isEmpty()) {
-        tls_delegateByIncubator[self] = { tls_pendingDelegateUrl, tls_pendingDelegateHeap };
+        tls_delegateByIncubator[self] = { tls_pendingDelegateUrl, tls_pendingDelegateParent,
+                                          tls_pendingDelegateHeap };
         tls_pendingDelegateUrl.clear();
+        tls_pendingDelegateParent.clear();
         tls_pendingDelegateHeap = 0;
+        if (subComponentsEnabled()) {
+            tls_inDelegateBuild = true;
+            tls_delegateRootSeen = false;
+            tls_subStack.clear();
+            tls_subComponents.clear();
+            tls_delegateSubHeap = 0;
+        }
     }
 }
 
@@ -570,6 +766,7 @@ void qml_incubatorCtor_hook(void *self, int mode)
 void qml_incubatorClear_hook(void *self)
 {
     resolveFunctions();
+    ++s_hookCounts[H_incubatorClear];
     auto it = tls_delegateByIncubator.find(self);
     bool hasDelegateInfo = (it != tls_delegateByIncubator.end());
 
@@ -585,6 +782,12 @@ void qml_incubatorClear_hook(void *self)
         // Refresh heapBefore so the delta covers actual delegate allocation, not QQDMIncubationTask.
         it->second.initClearFired = true;
         it->second.heapBefore = measureHeapSize();
+        if (subComponentsEnabled()) {   // real build starts now -> discard anything collected so far
+            tls_delegateRootSeen = false;
+            tls_subStack.clear();
+            tls_subComponents.clear();
+            tls_delegateSubHeap = 0;
+        }
         s_incubatorClearFn(self);
         return;
     }
@@ -622,18 +825,54 @@ void qml_incubatorClear_hook(void *self)
     // Skip if fine-grained QQmlObjectCreator hooks already tracked this delegate
     // (tls_initFromTypeFired is set by initFromType_hook in PLT-complete Qt builds like ARM/Yocto).
     if (hasDelegateInfo && obj != nullptr && !tls_initFromTypeFired) {
-        const QByteArray &url = !objectUrl.isEmpty() ? objectUrl : info.url;
-        if (!url.isEmpty()) {
+        // host = the file the delegate is used in (its creation context).
+        // node = the delegate's own file. For an inline delegate the two are the
+        // same, so we synthesise a node from the delegate's root type ("Button
+        // [delegate]") and hang it under the host, instead of folding it into the
+        // host's own number.
+        QByteArray host = info.parentUrl;
+        QByteArray node = !objectUrl.isEmpty() ? objectUrl : info.url;
+        if (host.isEmpty())
+            host = node;
+        if (node == host) {
+            QByteArray tn = obj->metaObject()->className();
+            int q = tn.indexOf("_QMLTYPE_");
+            if (q >= 0)
+                tn = tn.left(q);
+            if (tn.startsWith("QQuick"))
+                tn = tn.mid(6);
+            node = (tn.isEmpty() ? QByteArray("delegate") : tn) + " [delegate]";
+        }
+        if (!node.isEmpty()) {
+            QByteArray delegateParent = (host != node) ? host : QByteArray();
             size_t heapAfter = measureHeapSize();
-            objectTrack(url, true,  Delegate, {}, info.heapBefore);
-            objectTrack(url, false, Delegate, {}, heapAfter);
+
+            // With sub-component sizing on, the delegate's own number excludes its
+            // base components (shown as children); otherwise it is the full bracket.
+            long long bracket = static_cast<long long>(heapAfter) - static_cast<long long>(info.heapBefore);
+            long long delegateSelf = subComponentsEnabled() ? (bracket - tls_delegateSubHeap) : bracket;
+            objectTrack(node, true,  Delegate, delegateParent, info.heapBefore);
+            objectTrack(node, false, Delegate, delegateParent,
+                        static_cast<size_t>(static_cast<long long>(info.heapBefore) + delegateSelf));
+
+            // Emit the delegate's base components as a single child holding their
+            // total heap. Their individual file names aren't reachable on builds
+            // where the fine-grained hooks don't fire (the parent context URL just
+            // points back at the host, which would make a cycle), so a per-delegate
+            // placeholder key is used instead.
+            if (subComponentsEnabled() && tls_delegateSubHeap != 0) {
+                QByteArray baseKey = node + "  <base components>";
+                objectTrack(baseKey, true,  Delegate, node, info.heapBefore);
+                objectTrack(baseKey, false, Delegate, node,
+                            static_cast<size_t>(static_cast<long long>(info.heapBefore) + tls_delegateSubHeap));
+            }
 
             // The destroyed() signal fires from inside QObject::~QObject() before the
             // object's memory is returned to the allocator, so measureHeapSize() at that
             // point still includes the object. To produce a meaningful negative delta, we
             // fake the "before" heap as (heapNow + creationDelta), making the delta equal
             // to -creationDelta without inventing any allocation numbers.
-            QByteArray capturedUrl = url;
+            QByteArray capturedUrl = node;
             long long capturedDelta = static_cast<long long>(heapAfter)
                                     - static_cast<long long>(info.heapBefore);
             QObject::connect(obj, &QObject::destroyed, [capturedUrl, capturedDelta](QObject *) {
@@ -643,6 +882,15 @@ void qml_incubatorClear_hook(void *self)
                 objectTrack(capturedUrl, false, DelegateDestroy, {}, heapNow);
             });
         }
+    }
+
+    // Delegate build finished — stop collecting sub-components.
+    if (subComponentsEnabled()) {
+        tls_inDelegateBuild = false;
+        tls_delegateRootSeen = false;
+        tls_subStack.clear();
+        tls_subComponents.clear();
+        tls_delegateSubHeap = 0;
     }
 }
 
@@ -660,6 +908,7 @@ void qml_incubatorClear_hook(void *self)
 void qml_component_create_hook(void *self, void *incubator, void *context, void *forContext)
 {
     resolveFunctions();
+    ++s_hookCounts[H_componentCreate];
     if (!s_componentCreateFn)
         return;
 
@@ -668,6 +917,7 @@ void qml_component_create_hook(void *self, void *incubator, void *context, void 
     // that was tentatively created by qml_incubatorCtor_hook for this Loader incubator.
     tls_delegateByIncubator.erase(incubator);
     tls_pendingDelegateUrl.clear();
+    tls_pendingDelegateParent.clear();
 
     // If a delegate incubation is in progress (tls_delegateByIncubator is non-empty), this
     // create() call is for a style sub-object (e.g. Fusion Button.qml) loaded during delegate
@@ -681,6 +931,15 @@ void qml_component_create_hook(void *self, void *incubator, void *context, void 
     }
 
     QByteArray url = componentUrl(self);
+
+    // The host file (the file that contains the Loader) is the base URL of the
+    // context the component is created in — used as the tree parent so the
+    // loaded file nests under its host (e.g. listview.qml under Main.qml).
+    QByteArray hostUrl;
+    if (context && s_contextBaseUrlFn)
+        hostUrl = s_contextBaseUrlFn(context).toString().toUtf8();
+    if (hostUrl == url)
+        hostUrl.clear();
 
     // Reset flag so we can detect if initFromType fires during this call
     tls_initFromTypeFired = false;
@@ -700,8 +959,8 @@ void qml_component_create_hook(void *self, void *incubator, void *context, void 
     // Only track here if the fine-grained QQmlObjectCreator hooks did NOT fire.
     // If they fired, they already captured the creation with better granularity.
     if (!tls_initFromTypeFired && !url.isEmpty()) {
-        objectTrack(url, true,  ComponentCreate, {}, heapBefore);
-        objectTrack(url, false, ComponentCreate, {}, heapAfter);
+        objectTrack(url, true,  ComponentCreate, hostUrl, heapBefore);
+        objectTrack(url, false, ComponentCreate, hostUrl, heapAfter);
     }
 
     // Connect destroyed() on the root object to track component teardown (Loader unload / shutdown).
@@ -726,69 +985,473 @@ static size_t measureHeapSize()
     return static_cast<size_t>(info.uordblks);
 }
 
-void objectTrack(const QByteArray &url, bool startOfCreation, TrackType trackType,
-                 const QByteArray &parentUrl, size_t precomputedHeapSize)
+// ── Reporting & aggregation ─────────────────────────────────────────────
+//
+// By default the tracker prints a short heap-influence report to stderr when
+// the process exits: a tree of the QML files that contributed the most heap,
+// capping the breadth per level and bucketing the rest into an "others" entry.
+//
+// Environment variables:
+//   QML_OBJECT_TRACK_MODE     report (default) | timer | detailed
+//   QML_OBJECT_TRACK_ITEMS    max children shown per tree level   (default 10)
+//   QML_OBJECT_TRACK_INTERVAL seconds between reports (implies timer mode)
+//   QML_OBJECT_TRACK_DEPTH    max tree depth, 0 = unlimited       (default 0)
+//   QML_OBJECT_TRACK_CSV      1 to also write the detailed CSV in any mode
+//
+//   report   : one report at exit.
+//   timer    : a report every INTERVAL seconds, plus the final report at exit.
+//   detailed : like report, but also writes /tmp/qml-object-track.<pid>.csv
+//              (the per-instantiation log — the original behaviour).
+
+namespace {
+
+struct Config {
+    enum Mode { Report, Timer, Detailed };
+    Mode mode = Report;
+    int  items = 10;       // max children shown per tree level (rest -> "others")
+    int  intervalSec = 5;  // timer-mode period
+    int  maxDepth = 0;     // 0 == unlimited
+    bool csv = false;      // also write the detailed CSV
+    bool timer = false;    // run the periodic reporter
+};
+
+const Config &config()
 {
-    // File-scope state
-    static std::mutex s_mutex;
-    std::lock_guard<std::mutex> lock(s_mutex);
+    static const Config cfg = [] {
+        Config c;
+        if (const char *m = ::getenv("QML_OBJECT_TRACK_MODE")) {
+            if (!std::strcmp(m, "timer"))         { c.mode = Config::Timer;    c.timer = true; }
+            else if (!std::strcmp(m, "detailed")) { c.mode = Config::Detailed; c.csv = true; }
+        }
+        if (const char *v = ::getenv("QML_OBJECT_TRACK_ITEMS")) {
+            int n = ::atoi(v);
+            if (n > 0)
+                c.items = n;
+        }
+        if (const char *v = ::getenv("QML_OBJECT_TRACK_INTERVAL")) {
+            int n = ::atoi(v);
+            if (n > 0) {
+                c.intervalSec = n;
+                c.timer = true;
+            }
+        }
+        if (const char *v = ::getenv("QML_OBJECT_TRACK_DEPTH")) {
+            int n = ::atoi(v);
+            if (n >= 0)
+                c.maxDepth = n;
+        }
+        if (const char *v = ::getenv("QML_OBJECT_TRACK_CSV")) {
+            if (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y')
+                c.csv = true;
+        }
+        return c;
+    }();
+    return cfg;
+}
 
-    static int s_nestingLevel = 0;
-    static int s_startCount = 0; // cumulative calls with startOfFunction=true
-    static QStack<std::tuple<QByteArray, size_t>> s_creationStack;
+struct NodeAgg {
+    long long createDelta = 0;   // SELF (exclusive) heap added by this file, not its children
+    long long destroyDelta = 0;  // SELF heap freed during destruction (usually <= 0)
+    int createCount = 0;
+    int destroyCount = 0;
+};
 
-    const size_t heapSize = (precomputedHeapSize != 0) ? precomputedHeapSize : measureHeapSize();
-    QByteArray heapSizeDeltaStr;
+// One open creation/destruction bracket. childrenDelta accumulates the
+// (inclusive) deltas of nested brackets so that self = bracket - childrenDelta.
+struct Frame {
+    QByteArray url;
+    size_t heapBegin = 0;
+    long long childrenDelta = 0;
+};
 
-    if (startOfCreation) {
-        ++s_nestingLevel;
-        ++s_startCount;
-        s_creationStack.push({ url, heapSize });
+// All mutable tracker state lives in one heap-allocated, never-destroyed struct.
+// This keeps the at-exit report safe regardless of the order in which the C++
+// runtime tears down namespace-scope objects vs. runs atexit() handlers (the
+// report handler is registered from a library constructor, which can run before
+// namespace-scope objects are dynamically initialised).
+struct State {
+    std::mutex mutex;                                           // guards everything below
+    std::map<QByteArray, NodeAgg> nodes;                       // url -> aggregate (self)
+    std::map<QByteArray, std::map<QByteArray, NodeAgg>> edges;  // parentUrl -> childUrl -> aggregate
+    size_t peakHeap = 0;
+    int nestingLevel = 0;
+    int startCount = 0;
+    QStack<Frame> trackStack;
+    FILE *csvFile = nullptr;
+};
+
+State &state()
+{
+    static State *s = new State();  // intentionally leaked: never destroyed
+    return *s;
+}
+
+QByteArray fmtBytes(long long b)
+{
+    const char *sign = (b < 0) ? "-" : "+";
+    double a = (b < 0) ? -double(b) : double(b);
+    char buf[48];
+    if (a < 1024.0)
+        std::snprintf(buf, sizeof(buf), "%s%.0f B", sign, a);
+    else if (a < 1024.0 * 1024.0)
+        std::snprintf(buf, sizeof(buf), "%s%.1f KB", sign, a / 1024.0);
+    else
+        std::snprintf(buf, sizeof(buf), "%s%.1f MB", sign, a / (1024.0 * 1024.0));
+    return QByteArray(buf);
+}
+
+// Compact form: drop the URL scheme and keep the last two path segments so
+// common basenames (Button.qml) stay distinguishable.
+QByteArray shortUrl(const QByteArray &url)
+{
+    if (url.contains("<base components>"))   // namespaced key -> show the plain label
+        return QByteArray("<base components>");
+    QByteArray u = url;
+    int scheme = u.indexOf("://");
+    if (scheme >= 0)
+        u = u.mid(scheme + 3);
+    else if (u.startsWith("qrc:"))
+        u = u.mid(4);
+    if (u.isEmpty())
+        return QByteArray("<unknown>");
+    int slash = u.lastIndexOf('/');
+    if (slash > 0) {
+        int prev = u.lastIndexOf('/', slash - 1);
+        if (prev >= 0)
+            return u.mid(prev + 1);
+    }
+    return (slash >= 0) ? u.mid(slash + 1) : u;
+}
+
+// Called with state().mutex held.
+void accumulate(State &st, const QByteArray &url, const QByteArray &parentUrl,
+                TrackType type, long long delta)
+{
+    const bool isDestroy = (type == Destroy || type == DelegateDestroy);
+    NodeAgg &n = st.nodes[url];
+    if (isDestroy) {
+        n.destroyDelta += delta;
+        ++n.destroyCount;
     } else {
-        if (s_creationStack.isEmpty()) {
-            qWarning() << "QML-OBJECT-TRACK: unexpected end for component at" << url;
-        } else {
-            auto [urlBegin, heapSizeBegin] = s_creationStack.pop();
-            if (urlBegin != url)
-                qWarning() << "QML-OBJECT-TRACK: mismatched end for component:" << url << "expected:" << urlBegin;
-            else {
-                long long delta = static_cast<long long>(heapSize)
-                                - static_cast<long long>(heapSizeBegin);
-                heapSizeDeltaStr = QByteArray::number(delta);
+        // A creation bracket can't have freed net memory — a negative delta means
+        // unrelated frees happened to be captured in the (global mallinfo2) bracket
+        // window, common for tiny/shared objects (token singletons etc.). Don't
+        // attribute that to the creation; clamp it to zero.
+        if (delta < 0)
+            delta = 0;
+        // Count instances, not brackets. A single component instance produces
+        // several brackets: the create pass, a later finalize pass (bindings /
+        // componentComplete), and one bracket per inline sub-object — the latter
+        // carry the file's own url as their parent. Only the create/delegate/
+        // component pass with an external parent is a genuinely new instance.
+        const bool isInstance = (type != Finalize) && (parentUrl != url);
+        n.createDelta += delta;
+        if (isInstance)
+            ++n.createCount;
+        if (!parentUrl.isEmpty() && parentUrl != url) {
+            NodeAgg &e = st.edges[parentUrl][url];
+            e.createDelta += delta;
+            if (isInstance)
+                ++e.createCount;
+        }
+    }
+}
+
+// Inclusive subtree totals: a node's own self plus all of its descendants'.
+struct Incl { long long create = 0; long long destroy = 0; };
+
+Incl inclusiveOf(State &st, const QByteArray &url, std::set<QByteArray> &visited)
+{
+    Incl r;
+    auto nit = st.nodes.find(url);
+    if (nit != st.nodes.end()) {
+        r.create = nit->second.createDelta;
+        r.destroy = nit->second.destroyDelta;
+    }
+    if (!visited.insert(url).second)   // already on this path -> stop (cycle guard)
+        return r;
+    auto eit = st.edges.find(url);
+    if (eit != st.edges.end()) {
+        for (const auto &c : eit->second) {
+            Incl ci = inclusiveOf(st, c.first, visited);
+            r.create += ci.create;
+            r.destroy += ci.destroy;
+        }
+    }
+    visited.erase(url);
+    return r;
+}
+
+struct ChildRef { QByteArray url; int count; };
+
+// Gather the children of a node as ChildRefs, skipping destroy-only artifacts
+// (files seen only at teardown, e.g. base components on the coarse-hook path).
+std::vector<ChildRef> childrenOf(State &st, const QByteArray &url)
+{
+    std::vector<ChildRef> kids;
+    auto eit = st.edges.find(url);
+    if (eit != st.edges.end()) {
+        for (const auto &c : eit->second) {
+            auto nit = st.nodes.find(c.first);
+            if (nit != st.nodes.end() && nit->second.createCount > 0)
+                kids.push_back({ c.first, c.second.createCount });
+        }
+    }
+    return kids;
+}
+
+void printChildren(FILE *out, State &st, const std::vector<ChildRef> &children,
+                   int indent, int depth, std::set<QByteArray> &path)
+{
+    struct Row { QByteArray url; int count; Incl incl; long long self; };
+    std::vector<Row> rows;
+    rows.reserve(children.size());
+    for (const auto &c : children) {
+        std::set<QByteArray> vis;
+        Incl in = inclusiveOf(st, c.url, vis);
+        long long self = 0;
+        auto nit = st.nodes.find(c.url);
+        if (nit != st.nodes.end())
+            self = nit->second.createDelta;
+        rows.push_back({ c.url, c.count, in, self });
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+        return a.incl.create > b.incl.create;
+    });
+
+    const int cap = config().items;
+    long long othersIncl = 0;
+    int othersCount = 0;
+    int shown = 0;
+    for (const auto &row : rows) {
+        if (shown >= cap) {
+            othersIncl += row.incl.create;
+            ++othersCount;
+            continue;
+        }
+        ++shown;
+
+        QByteArray line(indent * 2, ' ');
+        line += shortUrl(row.url);
+        line += "  " + fmtBytes(row.incl.create);
+        line += "  x" + QByteArray::number(row.count);
+        if (row.self != row.incl.create)
+            line += "  self " + fmtBytes(row.self);
+        std::fprintf(out, "%s\n", line.constData());
+
+        const bool depthOk = (config().maxDepth == 0) || (depth < config().maxDepth);
+        if (depthOk && path.find(row.url) == path.end()) {
+            std::vector<ChildRef> kids = childrenOf(st, row.url);
+            if (!kids.empty()) {
+                path.insert(row.url);
+                printChildren(out, st, kids, indent + 1, depth + 1, path);
+                path.erase(row.url);
             }
         }
     }
-    // Lazy-open the CSV file on the first write
-    static FILE *s_csvFile = [] {
-        char filename[64];
-        std::snprintf(filename, sizeof(filename), "/tmp/qml-object-track.%d.csv", getpid());
-        auto f = std::fopen(filename, "w");
-        if (f)
-            qWarning() << "QML-OBJECT-TRACK: logging into" << filename;
-        else
-            qFatal() << "QML-OBJECT-TRACK: could not open" << filename << "for writing";
-        return f;
-    }();
+    if (othersCount > 0) {
+        QByteArray pad(indent * 2, ' ');
+        std::fprintf(out, "%s... others (%d files)  %s\n",
+                     pad.constData(), othersCount, fmtBytes(othersIncl).constData());
+    }
+}
 
-    const char *typeStr = trackType == Create          ? "create"
-                        : trackType == Finalize        ? "finalize"
-                        : trackType == Delegate        ? "delegate"
-                        : trackType == Destroy         ? "destroy"
-                        : trackType == DelegateDestroy ? "delegate-destroy"
-                        : "component";
+void printReport(const char *reason)
+{
+    State &st = state();
+    std::lock_guard<std::mutex> lock(st.mutex);
 
-    std::fprintf(s_csvFile,
-                 "%s,%s,%s,%zu,%s,%d,%d,%s\n",
-                 QByteArray(s_nestingLevel, startOfCreation ? '>' : '<').constData(),
-                 typeStr,
-                 url.constData(),
-                 heapSize,
-                 heapSizeDeltaStr.constData(),
-                 s_nestingLevel,
-                 s_startCount,
-                 parentUrl.constData());
-    std::fflush(s_csvFile);
+    const size_t now = measureHeapSize();
+    if (now > st.peakHeap)
+        st.peakHeap = now;
+
+    FILE *out = stderr;
+    std::fprintf(out, "\n==================== QML object-track report (%s) - pid %d ====================\n",
+                 reason, (int)getpid());
+    std::fprintf(out, "  malloc in-use now : %s\n", fmtBytes((long long)now).constData());
+    std::fprintf(out, "  peak malloc in-use: %s\n", fmtBytes((long long)st.peakHeap).constData());
+    size_t createdFiles = 0;
+    for (const auto &ne : st.nodes)
+        if (ne.second.createCount > 0)
+            ++createdFiles;
+    std::fprintf(out, "  QML files tracked : %zu   (showing top %d per level)\n",
+                 createdFiles, config().items);
+
+    if (::getenv("QML_OBJECT_TRACK_DEBUG")) {
+        std::fprintf(out, "  [debug] hook invocations:\n");
+        for (int i = 0; i < H_COUNT; ++i)
+            std::fprintf(out, "    %-30s %ld\n", s_hookNames[i], s_hookCounts[i].load());
+    }
+
+    if (createdFiles == 0) {
+        std::fprintf(out, "  (no QML component allocations recorded - note that jemalloc makes\n"
+                          "   mallinfo2 read 0, so the heap deltas need a glibc allocator)\n");
+        std::fprintf(out, "================================================================================\n\n");
+        std::fflush(out);
+        return;
+    }
+
+    // Roots = nodes that were created and that nothing else points to. Every
+    // other created node hangs off one of these via an edge.
+    std::set<QByteArray> childUrls;
+    for (const auto &pe : st.edges)
+        for (const auto &ce : pe.second)
+            childUrls.insert(ce.first);
+    std::vector<ChildRef> roots;
+    for (const auto &ne : st.nodes) {
+        if (ne.second.createCount <= 0)                       // destroy-only artifact
+            continue;
+        if (childUrls.find(ne.first) == childUrls.end())
+            roots.push_back({ ne.first, ne.second.createCount });
+    }
+    if (roots.empty()) {                                      // cycle fallback: show all created nodes
+        for (const auto &ne : st.nodes)
+            if (ne.second.createCount > 0)
+                roots.push_back({ ne.first, ne.second.createCount });
+    }
+
+    std::fprintf(out, "  QML trackdown:\n\n");
+    std::set<QByteArray> path;
+    printChildren(out, st, roots, 1, 0, path);
+    std::fprintf(out, "================================================================================\n\n");
+    std::fflush(out);
+}
+
+// ── Periodic (timer-mode) reporter ──────────────────────────────────────
+
+std::thread s_timerThread;
+std::mutex s_timerMutex;
+std::condition_variable s_timerCv;
+bool s_timerStop = false;
+std::atomic<bool> s_timerStarted{false};
+
+void stopTimerThread()
+{
+    if (!s_timerStarted.load())
+        return;
+    {
+        std::lock_guard<std::mutex> lk(s_timerMutex);
+        s_timerStop = true;
+    }
+    s_timerCv.notify_all();
+    if (s_timerThread.joinable())
+        s_timerThread.join();
+}
+
+void ensureReportingInit()
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        ::atexit([] {
+            stopTimerThread();
+            printReport("final");
+        });
+        if (config().timer) {
+            s_timerStarted.store(true);
+            s_timerThread = std::thread([] {
+                std::unique_lock<std::mutex> lk(s_timerMutex);
+                while (!s_timerStop) {
+                    if (s_timerCv.wait_for(lk, std::chrono::seconds(config().intervalSec),
+                                           [] { return s_timerStop; }))
+                        break;
+                    lk.unlock();
+                    printReport("interval");
+                    lk.lock();
+                }
+            });
+        }
+    });
+}
+
+} // namespace
+
+// Register the at-exit report (and start the timer thread, if requested) at
+// library-load time, so a report is still produced when the app never
+// instantiates a tracked QML component (e.g. a long-running idle process).
+__attribute__((constructor))
+static void qmlObjectTrackInit()
+{
+    ensureReportingInit();
+}
+
+void objectTrack(const QByteArray &url, bool startOfCreation, TrackType trackType,
+                 const QByteArray &parentUrl, size_t precomputedHeapSize)
+{
+    ensureReportingInit();
+    State &st = state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+
+    const size_t heapSize = (precomputedHeapSize != 0) ? precomputedHeapSize : measureHeapSize();
+    if (heapSize > st.peakHeap)
+        st.peakHeap = heapSize;
+
+    QByteArray heapSizeDeltaStr;
+    bool haveDelta = false;
+    long long selfDelta = 0;
+
+    if (startOfCreation) {
+        ++st.nestingLevel;
+        ++st.startCount;
+        st.trackStack.push({ url, heapSize, 0 });
+    } else {
+        if (st.trackStack.isEmpty()) {
+            qWarning() << "QML-OBJECT-TRACK: unexpected end for component at" << url;
+        } else {
+            Frame f = st.trackStack.pop();
+            if (f.url != url)
+                qWarning() << "QML-OBJECT-TRACK: mismatched end for component:" << url << "expected:" << f.url;
+            else {
+                // bracketDelta is inclusive (this file + everything created within
+                // its bracket); selfDelta subtracts the nested children so each
+                // file is counted once. The whole bracket is folded into the
+                // enclosing frame so its parent's self excludes us in turn.
+                long long bracketDelta = static_cast<long long>(heapSize)
+                                       - static_cast<long long>(f.heapBegin);
+                selfDelta = bracketDelta - f.childrenDelta;
+                heapSizeDeltaStr = QByteArray::number(bracketDelta);
+                haveDelta = true;
+                if (!st.trackStack.isEmpty())
+                    st.trackStack.top().childrenDelta += bracketDelta;
+            }
+        }
+    }
+
+    if (haveDelta)
+        accumulate(st, url, parentUrl, trackType, selfDelta);
+
+    // The detailed CSV is only written in detailed mode (or with CSV=1).
+    if (config().csv) {
+        if (!st.csvFile) {
+            char filename[64];
+            std::snprintf(filename, sizeof(filename), "/tmp/qml-object-track.%d.csv", getpid());
+            st.csvFile = std::fopen(filename, "w");
+            if (st.csvFile)
+                qWarning() << "QML-OBJECT-TRACK: logging into" << filename;
+            else
+                qWarning() << "QML-OBJECT-TRACK: could not open" << filename << "for writing";
+        }
+        if (st.csvFile) {
+            const char *typeStr = trackType == Create          ? "create"
+                                : trackType == Finalize        ? "finalize"
+                                : trackType == Delegate        ? "delegate"
+                                : trackType == Destroy         ? "destroy"
+                                : trackType == DelegateDestroy ? "delegate-destroy"
+                                : "component";
+
+            std::fprintf(st.csvFile,
+                         "%s,%s,%s,%zu,%s,%d,%d,%s\n",
+                         QByteArray(st.nestingLevel, startOfCreation ? '>' : '<').constData(),
+                         typeStr,
+                         url.constData(),
+                         heapSize,
+                         heapSizeDeltaStr.constData(),
+                         st.nestingLevel,
+                         st.startCount,
+                         parentUrl.constData());
+            std::fflush(st.csvFile);
+        }
+    }
 
     if (!startOfCreation)
-        --s_nestingLevel;
+        --st.nestingLevel;
 }

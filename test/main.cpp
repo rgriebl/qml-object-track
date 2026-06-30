@@ -62,5 +62,13 @@ int main(int argc, char *argv[])
 
     QQmlApplicationEngine engine;
     engine.loadFromModule("ObjectTrackTest", "Main");
+
+    // QML_QUIT_AFTER_MS=N : quit cleanly after N ms so the object-track library's
+    // at-exit report runs (the autotest uses _exit(), which bypasses atexit()).
+    if (qEnvironmentVariableIsSet("QML_QUIT_AFTER_MS")) {
+        int ms = qEnvironmentVariableIntValue("QML_QUIT_AFTER_MS");
+        QTimer::singleShot(ms > 0 ? ms : 3000, &app, &QGuiApplication::quit);
+    }
+
     return app.exec();
 }
