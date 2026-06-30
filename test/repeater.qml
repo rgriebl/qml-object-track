@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 
 Rectangle {
     Flickable {
@@ -13,13 +14,9 @@ Rectangle {
             width: flickable.width
             Repeater {
                 id: repeater
-                model: 100
-                delegate: Rectangle {
-                    width: 100
-                    height: 100
-                    color: Qt.rgba(Math.random(), Math.random(), Math.random(), 1)
-                    border.color: "black"
-                    border.width: 1
+                model: 1000
+                delegate: ComboBox {
+                    model: ["Combo " + index]
                 }
             }
         }
