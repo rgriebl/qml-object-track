@@ -49,6 +49,7 @@ Selected with `QML_OBJECT_TRACK_MODE`:
 | `QML_OBJECT_TRACK_ITEMS`    | `10`     | max children shown per tree level (rest → `others`)  |
 | `QML_OBJECT_TRACK_INTERVAL` | `5`      | seconds between reports; setting it implies `timer`  |
 | `QML_OBJECT_TRACK_DEPTH`    | `0`      | max tree depth, `0` = unlimited                      |
+| `QML_OBJECT_TRACK_MIN_SIZE` | `0`      | only list items whose inclusive size ≥ this; the rest fold into `others`. Accepts a `K`/`M`/`G` suffix (e.g. `1M`) |
 | `QML_OBJECT_TRACK_CSV`      | off      | `1` to also write the detailed CSV in any mode       |
 | `QML_OBJECT_TRACK_SUBCOMPONENTS` | off | set to break a delegate's separately-instantiated base components out as a `<base components>` child with their size |
 | `QML_OBJECT_TRACK_DEBUG`    | off      | set to print per-hook invocation counts (to diagnose hook coverage on a given Qt build) |
@@ -58,6 +59,13 @@ component creation/destruction (nesting, type, url, heap size, delta, parent).
 
 Heap deltas are measured with `mallinfo2()`, so they need a glibc allocator —
 under jemalloc `mallinfo2` reads 0 and the report has nothing to show.
+
+The report is the tree under the application root (the first file created).
+A component whose parent can't be determined — typically something built by
+deferred execution (a Controls indicator/popup created after its owner's
+creation bracket has already closed, with an anonymous parent context) — is
+**left out** of the report rather than shown at the top level where it would
+look like a root.
 
 ## Sub-component sizing (`QML_OBJECT_TRACK_SUBCOMPONENTS`)
 

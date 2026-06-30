@@ -496,6 +496,17 @@ void qml_objectCreator_ctor_hook(
     if (contextDataPtr)
         parentUrl = contextUrl(contextDataPtr);
 
+    // Deferred creations (Controls indicator/contentItem/background, popups) are
+    // built after their owner's bracket has closed, with an anonymous parent
+    // context that has no URL — which would orphan them to the report root. Fall
+    // back to the creationContext (the context the component was defined in) so
+    // they're attributed to their owning file instead.
+    if (parentUrl.isEmpty() && creationContext) {
+        void *ccPtr = *(void **)creationContext;
+        if (ccPtr)
+            parentUrl = contextUrl(ccPtr);
+    }
+
     // While a delegate is being built, open a heap bracket for this creator so
     // its (and its nested children's) size can be attributed under the delegate.
     // The outermost creator is the delegate root itself, so it is flagged isRoot
@@ -1011,6 +1022,7 @@ struct Config {
     int  items = 10;       // max children shown per tree level (rest -> "others")
     int  intervalSec = 5;  // timer-mode period
     int  maxDepth = 0;     // 0 == unlimited
+    long long minSize = 0; // only list items whose inclusive size >= this (rest -> "others")
     bool csv = false;      // also write the detailed CSV
     bool timer = false;    // run the periodic reporter
 };
@@ -1039,6 +1051,16 @@ const Config &config()
             int n = ::atoi(v);
             if (n >= 0)
                 c.maxDepth = n;
+        }
+        if (const char *v = ::getenv("QML_OBJECT_TRACK_MIN_SIZE")) {
+            char *end = nullptr;
+            long long n = ::strtoll(v, &end, 10);
+            if (n > 0) {
+                if (end && (*end == 'k' || *end == 'K')) n *= 1024;
+                else if (end && (*end == 'm' || *end == 'M')) n *= 1024LL * 1024;
+                else if (end && (*end == 'g' || *end == 'G')) n *= 1024LL * 1024 * 1024;
+                c.minSize = n;
+            }
         }
         if (const char *v = ::getenv("QML_OBJECT_TRACK_CSV")) {
             if (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y')
@@ -1073,6 +1095,7 @@ struct State {
     std::mutex mutex;                                           // guards everything below
     std::map<QByteArray, NodeAgg> nodes;                       // url -> aggregate (self)
     std::map<QByteArray, std::map<QByteArray, NodeAgg>> edges;  // parentUrl -> childUrl -> aggregate
+    QByteArray rootUrl;                                        // first file created = the tree root
     size_t peakHeap = 0;
     int nestingLevel = 0;
     int startCount = 0;
@@ -1220,11 +1243,15 @@ void printChildren(FILE *out, State &st, const std::vector<ChildRef> &children,
     });
 
     const int cap = config().items;
+    const long long minSize = config().minSize;
     long long othersIncl = 0;
     int othersCount = 0;
     int shown = 0;
     for (const auto &row : rows) {
-        if (shown >= cap) {
+        // Fold into "others" once past the per-level item cap, or below the
+        // configured minimum size (rows are sorted big-first, so this keeps the
+        // largest contributors and buckets the long tail of small ones).
+        if (shown >= cap || (minSize > 0 && row.incl.create < minSize)) {
             othersIncl += row.incl.create;
             ++othersCount;
             continue;
@@ -1291,22 +1318,23 @@ void printReport(const char *reason)
         return;
     }
 
-    // Roots = nodes that were created and that nothing else points to. Every
-    // other created node hangs off one of these via an edge.
-    std::set<QByteArray> childUrls;
-    for (const auto &pe : st.edges)
-        for (const auto &ce : pe.second)
-            childUrls.insert(ce.first);
+    // The report is the tree under the application root (the first file created).
+    // Any other node with no incoming edge is a creation whose parent we couldn't
+    // determine (a deferred orphan, e.g. a Controls indicator/popup built after its
+    // owner's bracket closed). Rather than show those at the top level where they'd
+    // masquerade as roots, we leave them out entirely.
     std::vector<ChildRef> roots;
-    for (const auto &ne : st.nodes) {
-        if (ne.second.createCount <= 0)                       // destroy-only artifact
-            continue;
-        if (childUrls.find(ne.first) == childUrls.end())
-            roots.push_back({ ne.first, ne.second.createCount });
-    }
-    if (roots.empty()) {                                      // cycle fallback: show all created nodes
+    auto rit = st.nodes.find(st.rootUrl);
+    if (rit != st.nodes.end() && rit->second.createCount > 0) {
+        roots.push_back({ st.rootUrl, rit->second.createCount });
+    } else {
+        // Fallback (no recorded root): show every created node with no incoming edge.
+        std::set<QByteArray> childUrls;
+        for (const auto &pe : st.edges)
+            for (const auto &ce : pe.second)
+                childUrls.insert(ce.first);
         for (const auto &ne : st.nodes)
-            if (ne.second.createCount > 0)
+            if (ne.second.createCount > 0 && childUrls.find(ne.first) == childUrls.end())
                 roots.push_back({ ne.first, ne.second.createCount });
     }
 
@@ -1392,6 +1420,8 @@ void objectTrack(const QByteArray &url, bool startOfCreation, TrackType trackTyp
     if (startOfCreation) {
         ++st.nestingLevel;
         ++st.startCount;
+        if (st.startCount == 1)
+            st.rootUrl = url;   // the first file created is the application/tree root
         st.trackStack.push({ url, heapSize, 0 });
     } else {
         if (st.trackStack.isEmpty()) {
